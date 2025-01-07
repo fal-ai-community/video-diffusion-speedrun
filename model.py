@@ -41,65 +41,6 @@ class RMSNorm(nn.Module):
             return (x * norm).to(dtype=x_dtype)
 
 
-class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        num_heads=8,
-        qkv_bias=False,
-        is_self_attn=True,
-        cross_attn_input_size=None,
-        residual_v=False,
-    ):
-        super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.is_self_attn = is_self_attn
-        self.residual_v = residual_v
-
-        if is_self_attn:
-            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        else:
-            self.q = nn.Linear(dim, dim, bias=qkv_bias)
-            self.context_kv = nn.Linear(cross_attn_input_size, dim * 2, bias=qkv_bias)
-
-        self.proj = nn.Linear(dim, dim, bias=False)
-
-        if residual_v:
-            self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
-
-    def forward(self, x, context=None, v_0=None, rope=None):
-        if self.is_self_attn:
-            qkv = self.qkv(x)
-            qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
-            q, k, v = qkv.unbind(0)
-
-            if self.residual_v and v_0 is not None:
-                v = self.lambda_param * v + (1 - self.lambda_param) * v_0
-
-            if rope is not None:
-                # print(q.shape, rope[0].shape, rope[1].shape)
-                q = apply_rotary_emb(q, rope[0], rope[1])
-                k = apply_rotary_emb(k, rope[0], rope[1])
-
-        else:
-            q = rearrange(self.q(x), "b l (h d) -> b h l d", h=self.num_heads)
-            kv = rearrange(
-                self.context_kv(context),
-                "b l (k h d) -> k b h l d",
-                k=2,
-                h=self.num_heads,
-            )
-            k, v = kv.unbind(0)
-
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b h l d -> b l (h d)")
-        x = self.proj(x)
-        return x, v if self.is_self_attn else None
-
-
 class DiTBlock(nn.Module):
     def __init__(
         self,
@@ -112,27 +53,30 @@ class DiTBlock(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim**-0.5
+        self.residual_v = residual_v
+
         self.norm1 = RMSNorm(hidden_size, trainable=qkv_bias)
-        self.self_attn = Attention(
-            hidden_size,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            is_self_attn=True,
-            residual_v=residual_v,
-        )
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias)
+        self.attn_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        if residual_v:
+            self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
 
         if cross_attn_input_size is not None:
             self.norm2 = RMSNorm(hidden_size, trainable=qkv_bias)
-            self.cross_attn = Attention(
-                hidden_size,
-                num_heads=num_heads,
-                qkv_bias=qkv_bias,
-                is_self_attn=False,
-                cross_attn_input_size=cross_attn_input_size,
+            self.q_cross = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+            self.context_kv = nn.Linear(
+                cross_attn_input_size, hidden_size * 2, bias=qkv_bias
             )
+            self.cross_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         else:
             self.norm2 = None
-            self.cross_attn = None
+            self.q_cross = None
+            self.context_kv = None
+            self.cross_proj = None
 
         self.norm3 = RMSNorm(hidden_size, trainable=qkv_bias)
         mlp_hidden = int(hidden_size * mlp_ratio)
@@ -149,9 +93,7 @@ class DiTBlock(nn.Module):
         self.adaLN_modulation[-1].weight.data.zero_()
         self.adaLN_modulation[-1].bias.data.zero_()
 
-    # @torch.compile(mode='reduce-overhead')
-    def forward(self, x, context, c, v_0=None, multiplier=1.0, rope=None):
-
+    def forward(self, x, context, c, v_0=None, rope=None):
         (
             shift_sa,
             scale_sa,
@@ -176,16 +118,48 @@ class DiTBlock(nn.Module):
         gate_ca = gate_ca[:, None, :]
         gate_mlp = gate_mlp[:, None, :]
 
-        norm_x = self.norm1(x.clone())
+        # Self attention
+        norm_x = self.norm1(x)
         norm_x = norm_x * (1 + scale_sa) + shift_sa
-        attn_out, v = self.self_attn(norm_x, v_0=v_0, rope=rope)
+
+        qkv = self.qkv(norm_x)
+        qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
+        q, k, v = qkv.unbind(0)
+
+        if self.residual_v and v_0 is not None:
+            v = self.lambda_param * v + (1 - self.lambda_param) * v_0
+
+        if rope is not None:
+            q = apply_rotary_emb(q, rope[0], rope[1])
+            k = apply_rotary_emb(k, rope[0], rope[1])
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = rearrange(attn_out, "b h l d -> b l (h d)")
+        attn_out = self.attn_proj(attn_out)
         x = x + attn_out * gate_sa
 
+        # Cross attention
         if self.norm2 is not None:
             norm_x = self.norm2(x)
             norm_x = norm_x * (1 + scale_ca) + shift_ca
-            x = x + self.cross_attn(norm_x, context)[0] * gate_ca
 
+            q = rearrange(
+                self.q_cross(norm_x), "b l (h d) -> b h l d", h=self.num_heads
+            )
+            context_kv = rearrange(
+                self.context_kv(context),
+                "b l (k h d) -> k b h l d",
+                k=2,
+                h=self.num_heads,
+            )
+            context_k, context_v = context_kv.unbind(0)
+
+            cross_out = F.scaled_dot_product_attention(q, context_k, context_v)
+            cross_out = rearrange(cross_out, "b h l d -> b l (h d)")
+            cross_out = self.cross_proj(cross_out)
+            x = x + cross_out * gate_ca
+
+        # MLP
         norm_x = self.norm3(x)
         norm_x = norm_x * (1 + scale_mlp) + shift_mlp
         x = x + self.mlp(norm_x) * gate_mlp
@@ -197,10 +171,14 @@ class PatchEmbed(nn.Module):
     def __init__(self, patch_size=16, in_channels=3, embed_dim=768, time_patch_size=16):
         super().__init__()
         self.patch_proj = nn.Conv3d(
-            in_channels, embed_dim, kernel_size=(time_patch_size, patch_size, patch_size), stride=(time_patch_size, patch_size, patch_size)
+            in_channels,
+            embed_dim,
+            kernel_size=(time_patch_size, patch_size, patch_size),
+            stride=(time_patch_size, patch_size, patch_size),
         )
         self.patch_size = patch_size
         self.time_patch_size = time_patch_size
+
     def forward(self, x):
         B, C, T, H, W = x.shape
         x = self.patch_proj(x)
@@ -220,10 +198,16 @@ class ThreeDimRotary(torch.nn.Module):
         t_h = torch.arange(h).type_as(self.inv_freq_space)
         t_w = torch.arange(w).type_as(self.inv_freq_space)
         t_t = torch.arange(t).type_as(self.inv_freq_time)
-        
-        freqs_h = torch.outer(t_h, self.inv_freq_space).reshape(1, h, 1, dim // 4)  # 1, h, 1, d / 4
-        freqs_w = torch.outer(t_w, self.inv_freq_space).reshape(1, 1, w, dim // 4)  # 1, 1, w, d / 4
-        freqs_t = torch.outer(t_t, self.inv_freq_time).reshape(t,  1, 1, dim // 2)  # t, 1, 1, d / 2
+
+        freqs_h = torch.outer(t_h, self.inv_freq_space).reshape(
+            1, h, 1, dim // 4
+        )  # 1, h, 1, d / 4
+        freqs_w = torch.outer(t_w, self.inv_freq_space).reshape(
+            1, 1, w, dim // 4
+        )  # 1, 1, w, d / 4
+        freqs_t = torch.outer(t_t, self.inv_freq_time).reshape(
+            t, 1, 1, dim // 2
+        )  # t, 1, 1, d / 2
         freqs_h = freqs_h.repeat(t, 1, w, 1)  # t, h, w, d / 4
         freqs_w = freqs_w.repeat(t, h, 1, 1)  # t, h, w, d / 4
         freqs_t = freqs_t.repeat(1, h, w, 1)  # t, h, w, d / 2
@@ -234,16 +218,23 @@ class ThreeDimRotary(torch.nn.Module):
 
     def forward(self, x, time_height_width=None, extend_with_register_tokens=0):
 
-        
         this_t, this_h, this_w = time_height_width
-       
+
         # randomly, we augment the height and width
         start_h = torch.randint(0, self.h - this_h + 1, (1,)).item()
         start_w = torch.randint(0, self.w - this_w + 1, (1,)).item()
         start_t = torch.randint(0, self.t - this_t + 1, (1,)).item()
 
-        cos = self.freqs_hwt_cos[start_t : start_t + this_t, start_h : start_h + this_h, start_w : start_w + this_w]
-        sin = self.freqs_hwt_sin[start_t : start_t + this_t, start_h : start_h + this_h, start_w : start_w + this_w]
+        cos = self.freqs_hwt_cos[
+            start_t : start_t + this_t,
+            start_h : start_h + this_h,
+            start_w : start_w + this_w,
+        ]
+        sin = self.freqs_hwt_sin[
+            start_t : start_t + this_t,
+            start_h : start_h + this_h,
+            start_w : start_w + this_w,
+        ]
 
         cos = cos.clone().reshape(this_h * this_w * this_t, -1)
         sin = sin.clone().reshape(this_h * this_w * this_t, -1)
@@ -311,10 +302,14 @@ class DiT(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.use_rope = use_rope
 
-        self.patch_embed = PatchEmbed(patch_size, in_channels, hidden_size, time_patch_size)
+        self.patch_embed = PatchEmbed(
+            patch_size, in_channels, hidden_size, time_patch_size
+        )
 
         if self.use_rope:
-            self.rope = ThreeDimRotary(hidden_size // (2 * num_heads), h=128, w=128, t=128)
+            self.rope = ThreeDimRotary(
+                hidden_size // (2 * num_heads), h=128, w=128, t=128
+            )
         else:
             self.positional_embedding = nn.Parameter(torch.zeros(1, 2048, hidden_size))
 
@@ -369,10 +364,14 @@ class DiT(nn.Module):
         cos, sin = self.rope(
             x,
             extend_with_register_tokens=16,
-            time_height_width=(t // self.time_patch_size, h // self.patch_size, w // self.patch_size),
+            time_height_width=(
+                t // self.time_patch_size,
+                h // self.patch_size,
+                w // self.patch_size,
+            ),
         )
 
-        t_emb = timestep_embedding(timesteps , self.hidden_size).to(
+        t_emb = timestep_embedding(timesteps, self.hidden_size).to(
             x.device, dtype=x.dtype
         )
         t_emb = self.time_embed(t_emb)
@@ -443,13 +442,12 @@ class DiT(nn.Module):
                 ):
                     lr_value = learning_rate * 0.01
                     per_layer_weight_decay_value = 0.0
-                    
+
                 # modify lr once more for specific params
-                if 'time' in n:
+                if "time" in n:
                     lr_value = learning_rate * 0.1
-                if 'modulation' in n:
+                if "modulation" in n:
                     lr_value = learning_rate * 0.1
-                
 
                 group_key = (lr_value, per_layer_weight_decay_value)
                 param_groups[group_key]["params"].append(p)
@@ -461,22 +459,17 @@ class DiT(nn.Module):
                     "wd": per_layer_weight_decay_value,
                     "shape": status["shape"],
                 }
-        
+
         optimizer_grouped_parameters = [v for v in param_groups.values()]
 
         return optimizer_grouped_parameters, final_optimizer_settings
 
 
-from torch.distributed import DeviceMesh
-from torch.distributed._composable.fsdp import (
-    fully_shard,
-    CPUOffloadPolicy,
-    MixedPrecisionPolicy,
-)
+from functools import reduce
 
-from functools import lru_cache, partial, reduce
 import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.device_mesh import init_device_mesh
 
 
 def get_device_mesh():

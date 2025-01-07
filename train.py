@@ -1,37 +1,18 @@
-import logging
-import os
-import random
-import time
-import math
-from pathlib import Path
 import gc
+import logging
+import math
+import os
+import time
+from pathlib import Path
 
 import click
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.optim as optim
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, wrap
-
-from torch.distributed.fsdp.api import MixedPrecision
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    get_state_dict,
-    set_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
-)
-
-from torch.distributed.checkpoint.format_utils import (
-    torch_save_to_dcp,
-    dcp_to_torch_save,
-)
-
-import pandas as pd
+import torch.optim as optim
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
 # Enable TF32 for faster training
 torch._inductor.config.coordinate_descent_tuning = True
@@ -42,6 +23,11 @@ torch._inductor.config.fx_graph_cache = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+from transformers import (
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
+
 import wandb
 from model import DiT, apply_fsdp
 from utils import (
@@ -49,10 +35,6 @@ from utils import (
     create_dataloader,
     encode_prompt_with_t5,
     load_encoders,
-)
-from transformers import (
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
 )
 
 CAPTURE_INPUT = False
@@ -69,7 +51,6 @@ def ceil_to_multiple(x, multiple):
 def forward(
     dit_model: DiT,
     batch,
-    vae_model,
     text_encoder,
     tokenizer,
     device,
@@ -83,16 +64,16 @@ def forward(
     logger = logging.getLogger(__name__)
 
     captions = batch["prompt"]
-    
+
     images_vae = batch["latent"]
-    
+
     print(captions, images_vae.shape)
-    
+
     preprocess_start = time.time()
     vae_latent = images_vae.to(device).to(torch.bfloat16)
 
     with torch.no_grad():
-        
+
         caption_encoded = encode_prompt_with_t5(
             text_encoder,
             tokenizer,
@@ -102,7 +83,6 @@ def forward(
         )
         caption_encoded = caption_encoded.to(torch.bfloat16)
 
-
     batch_size = vae_latent.size(0)
     z = torch.randn(
         batch_size, device=device, dtype=torch.bfloat16, generator=generator
@@ -111,7 +91,6 @@ def forward(
     # time shift
     alpha = 2.0
     t = t * alpha / (1 + (alpha - 1) * t)
-   
 
     if CAPTURE_INPUT and master_process and global_step == 0:
         torch.save(vae_latent, f"test_data/vae_latent_{global_step}.pt")
@@ -164,18 +143,6 @@ def forward(
 
 
 @click.command()
-@click.option(
-    "--dataset_url",
-    type=str,
-    default="x.csv",
-    help="URL for training dataset",
-)
-@click.option(
-    "--test_dataset_url",
-    type=str,
-    default="x.csv",
-    help="URL for test dataset",
-)
 @click.option("--num_epochs", type=int, default=2, help="Number of training epochs")
 @click.option("--batch_size", type=int, default=64, help="Batch size for training")
 @click.option("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -190,17 +157,7 @@ def forward(
     "--model_head_dim", type=int, default=128, help="Head dimension of the model"
 )
 @click.option("--compile_models", type=bool, default=False, help="Compile models")
-@click.option(
-    "--batch_multiplicity",
-    type=int,
-    default=1,
-    help="Batch multiplicity: Duplicate batch size by this factor, draws multiple timesteps from the same image",
-)
 @click.option("--optimizer_type", type=str, default="mup_adam", help="Optimizer type")
-@click.option("--residual_v", type=bool, default=False, help="Use residual v")
-@click.option(
-    "--bs_rampup", type=int, default=None, help="Number of steps for batch size rampup"
-)
 @click.option(
     "--lr_scheduler_type",
     type=str,
@@ -232,8 +189,6 @@ def forward(
     help="Path to checkpoint to load",
 )
 def train_fsdp(
-    dataset_url,
-    test_dataset_url,
     num_epochs,
     batch_size,
     learning_rate,
@@ -244,10 +199,7 @@ def train_fsdp(
     model_depth,
     model_head_dim,
     compile_models,
-    batch_multiplicity,
     optimizer_type,
-    residual_v,
-    bs_rampup,
     lr_scheduler_type,
     train_bias_and_rms,
     init_std_factor,
@@ -272,9 +224,7 @@ def train_fsdp(
 
     # Initialize wandb for the master process
 
-    vae_model, tokenizer, text_encoder = load_encoders(
-        device=device, compile_models=False
-    )
+    tokenizer, text_encoder = load_encoders(device=device, compile_models=False)
 
     # with torch.device("meta" if load_checkpoint is not None else device):
     dit_model = DiT(
@@ -285,7 +235,7 @@ def train_fsdp(
         mlp_ratio=4.0,
         cross_attn_input_size=4096,
         hidden_size=model_width,
-        residual_v=residual_v,
+        residual_v=True,
         train_bias_and_rms=train_bias_and_rms,
         use_rope=True,
     )
@@ -300,14 +250,10 @@ def train_fsdp(
     param_count = sum(p.numel() for p in dit_model.parameters())
 
     if master_process:
-        print(f"dataset_url: {dataset_url}")
-        print(f"test_dataset_url: {test_dataset_url}")
         print(f"batch_size: {batch_size}")
-        print(f"batch_multiplicity: {batch_multiplicity}")
         print(f"model_width: {model_width}")
         print(f"model_depth: {model_depth}")
         print(f"model_head_dim: {model_head_dim}")
-        print(f"residual_v: {residual_v}")
         print(f"train_bias_and_rms: {train_bias_and_rms}")
         print(f"init_std_factor: {init_std_factor}")
         print(f"optimizer_type: {optimizer_type}")
@@ -330,9 +276,6 @@ def train_fsdp(
                 "model_width": model_width,
                 "model_depth": model_depth,
                 "model_head_dim": model_head_dim,
-                "batch_multiplicity": batch_multiplicity,
-                "residual_v": residual_v,
-                "bs_rampup": bs_rampup,
                 "train_bias_and_rms": train_bias_and_rms,
             },
         )
@@ -347,7 +290,7 @@ def train_fsdp(
     if load_checkpoint is not None:
         checkpoint_path = Path(load_checkpoint)
         load_via_pt = True
-        
+
         if load_via_pt:
             if master_process:
                 if not os.path.exists(checkpoint_path / "temp.pt"):
@@ -362,18 +305,17 @@ def train_fsdp(
                 .to(device, dtype=torch.float32)
                 for k, v in state_dict.items()
             }
-            
-            status = dit_model.load_state_dict(state_dict, assign=True, strict = False)
-            
-            
+
+            status = dit_model.load_state_dict(state_dict, assign=True, strict=False)
+
             print(f"Rank {ddp_rank} done loading checkpoint, {status}")
-            
+
             del state_dict
             dit_model = dit_model.to(device)
 
             dist.barrier()
             print(f"Rank {ddp_rank} done loading checkpoint, {status}")
-            
+
     # print(f"Loaded checkpoint from {load_checkpoint}")
     dit_model = apply_fsdp(
         dit_model, param_dtype=torch.bfloat16, reduce_dtype=torch.float32
@@ -382,7 +324,7 @@ def train_fsdp(
     if compile_models:
         torch._dynamo.config.cache_size_limit = 8
         dit_model = torch.compile(dit_model)
-        
+
     dist.barrier()
     # state_dict = {}
 
@@ -419,16 +361,13 @@ def train_fsdp(
         raise ValueError(f"Unknown lr scheduler type: {lr_scheduler_type}")
 
     train_loader = create_dataloader(
-        None,
-        batch_size // batch_multiplicity,
+        "train",
+        batch_size,
         num_workers=2,
         do_shuffle=True,
-        infinite=True,
     )
 
-    test_loader = create_dataloader(
-        None, batch_size, num_workers=1, do_shuffle=False, infinite=False
-    )
+    test_loader = create_dataloader("test", batch_size, num_workers=1, do_shuffle=False)
 
     # Setup logging
     logger = logging.getLogger(__name__)
@@ -469,7 +408,6 @@ def train_fsdp(
             total_loss, diffusion_loss = forward(
                 dit_model,
                 batch,
-                vae_model,
                 text_encoder,
                 tokenizer,
                 device,
@@ -577,7 +515,6 @@ def train_fsdp(
                         total_loss, diffusion_loss = forward(
                             dit_model,
                             batch,
-                            vae_model,
                             text_encoder,
                             tokenizer,
                             device,
@@ -619,7 +556,7 @@ def train_fsdp(
                     print(
                         f"Saving model state dict to checkpoints/{run_name}/{global_step}"
                     )
-                    
+
                     stats = {
                         k: v / max(c, 1)
                         for k, v, c in zip(
@@ -651,6 +588,6 @@ def train_fsdp(
 
 
 if __name__ == "__main__":
-    import functools
+    pass
 
     train_fsdp()

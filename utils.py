@@ -1,13 +1,12 @@
 import torch
 import torch.distributed as dist
-import torchvision.transforms as transforms
-from diffusers import AutoencoderKL
+from torch.utils.data import DataLoader
 from transformers import T5EncoderModel, T5TokenizerFast
+
 from sharded_dataset import LatentDataset
 
-from torch.utils.data import DataLoader
-
 torch.set_float32_matmul_precision("high")
+
 
 def avg_scalar_across_ranks(scalar):
     world_size = dist.get_world_size()
@@ -16,12 +15,25 @@ def avg_scalar_across_ranks(scalar):
     return scalar_tensor.item()
 
 
-def create_dataloader(
-    urls, batch_size, num_workers, do_shuffle, prefetch_factor=8, infinite=True
-):
-    dset = LatentDataset(size=1000, channels=16, frames=16, height=32, width=32, max_prompt_length=77)
-    dl = DataLoader(dset, batch_size=batch_size, num_workers=num_workers, shuffle=do_shuffle, prefetch_factor=prefetch_factor)
+def create_dataloader(split, batch_size, num_workers, do_shuffle, prefetch_factor=8):
+    dset = LatentDataset(split=split)
+
+    def collate_fn(batch):
+        return {
+            "latent": torch.stack([item["latent"] for item in batch]),
+            "prompt": [item["prompt"] for item in batch],
+        }
+
+    dl = DataLoader(
+        dset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=do_shuffle,
+        prefetch_factor=prefetch_factor,
+        collate_fn=collate_fn,
+    )
     return dl
+
 
 def encode_prompt_with_t5(
     text_encoder,
@@ -75,7 +87,6 @@ def load_encoders(
     compile_models=True,
 ):
 
-  
     tokenizer = T5TokenizerFast.from_pretrained(
         text_encoder_path, subfolder="tokenizer_2"
     )
@@ -96,4 +107,4 @@ def load_encoders(
             text_encoder.forward, mode="reduce-overhead"
         )
 
-    return None, tokenizer, text_encoder
+    return tokenizer, text_encoder
