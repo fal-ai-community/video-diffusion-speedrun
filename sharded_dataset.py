@@ -16,7 +16,7 @@ def deserialize_tensor(serialized_tensor: bytes, device=None) -> torch.Tensor:
 class LatentDataset(Dataset):
     def __init__(self, split="train", cache_dir="./cache"):
         MS = 1979810 // 2
-        RANGE = range(0, MS - 1000) if split == "train" else range(MS - 1000, MS)
+        RANGE = range(0, MS - 40) if split == "train" else range(MS - 40, MS)
 
         self.dataset = load_dataset(
             "fal/cosmos-openvid-1m", split="train", cache_dir=cache_dir
@@ -33,7 +33,7 @@ class LatentDataset(Dataset):
 
 
 if __name__ == "__main__":
-    dset = LatentDataset(split="train", device="cuda")
+    dset = LatentDataset(split="test")
     print(f"Length: {len(dset)}")
     print(dset[0])
     # iterate and check the length of the latent tensor
@@ -46,3 +46,5 @@ if __name__ == "__main__":
             dset[i]["latent"].mean(),
             dset[i]["latent"].std(),
         )
+
+        print(dset[i]["prompt"])

@@ -67,7 +67,7 @@ def forward(
 
     images_vae = batch["latent"]
 
-    print(captions, images_vae.shape)
+    # print(captions, images_vae.shape)
 
     preprocess_start = time.time()
     vae_latent = images_vae.to(device).to(torch.bfloat16)
@@ -83,13 +83,16 @@ def forward(
         )
         caption_encoded = caption_encoded.to(torch.bfloat16)
 
+        do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.01
+        caption_encoded[do_zero_out] = 0
+
     batch_size = vae_latent.size(0)
     z = torch.randn(
         batch_size, device=device, dtype=torch.bfloat16, generator=generator
     )
     t = torch.nn.Sigmoid()(z)
     # time shift
-    alpha = 2.0
+    alpha = 8.0
     t = t * alpha / (1 + (alpha - 1) * t)
 
     if CAPTURE_INPUT and master_process and global_step == 0:
@@ -121,17 +124,17 @@ def forward(
 
     diffusion_loss = diffusion_loss_batchwise.mean()
 
-    # timestep binning
-    tbins = [int(_t * 10) for _t in t]
+    # # timestep binning
+    # tbins = [int(_t * 10) for _t in t]
 
-    if binnings is not None:
-        (
-            diffusion_loss_binning,
-            diffusion_loss_binning_count,
-        ) = binnings
-        for idx, tb in enumerate(tbins):
-            diffusion_loss_binning[tb] += diffusion_loss_batchwise[idx].item()
-            diffusion_loss_binning_count[tb] += 1
+    # if binnings is not None:
+    #     (
+    #         diffusion_loss_binning,
+    #         diffusion_loss_binning_count,
+    #     ) = binnings
+    #     for idx, tb in enumerate(tbins):
+    #         diffusion_loss_binning[tb] += diffusion_loss_batchwise[idx].item()
+    #         diffusion_loss_binning_count[tb] += 1
 
     total_loss = diffusion_loss
 
@@ -171,7 +174,7 @@ def forward(
     help="Use unlearnable rms and bias",
 )
 @click.option(
-    "--init_std_factor", type=float, default=1.0, help="Factor to scale init std"
+    "--init_std_factor", type=float, default=0.1, help="Factor to scale init std"
 )
 @click.option(
     "--project_name", type=str, default="test_diffusion_test", help="Project name"
@@ -179,7 +182,7 @@ def forward(
 @click.option(
     "--return_index",
     type=int,
-    default=-1,
+    default=-8,
     help="Return index for T5 encoding. Default is -1 which returns the last state.",
 )
 @click.option(
@@ -343,7 +346,7 @@ def train_fsdp(
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
-    num_warmup_steps = 500
+    num_warmup_steps = 20
 
     if lr_scheduler_type == "cosine":
         lr_scheduler = get_cosine_schedule_with_warmup(
@@ -363,8 +366,9 @@ def train_fsdp(
     train_loader = create_dataloader(
         "train",
         batch_size,
-        num_workers=2,
+        num_workers=8,
         do_shuffle=True,
+        prefetch_factor=4,
     )
 
     test_loader = create_dataloader("test", batch_size, num_workers=1, do_shuffle=False)
@@ -588,6 +592,5 @@ def train_fsdp(
 
 
 if __name__ == "__main__":
-    pass
 
     train_fsdp()

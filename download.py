@@ -25,9 +25,9 @@ def deserialize_tensor(serialized_tensor: bytes, device=None) -> torch.Tensor:
 
 
 for i in range(10):
-    print(deserialize_tensor(ds["train"][rows // 2 - 9 + i]["serialized_latent"]).dtype)
-
+    print(deserialize_tensor(ds["train"][rows // 2 - 9 + i]["serialized_latent"]).shape)
+    print(ds["train"][rows // 2 - 9 + i]["caption"])
 print("---")
 
 for i in range(10):
-    print(deserialize_tensor(ds["train"][rows - 9 + i]["serialized_latent"]).dtype)
+    print(deserialize_tensor(ds["train"][rows - 9 + i]["serialized_latent"]).shape)

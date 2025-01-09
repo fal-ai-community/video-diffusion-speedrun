@@ -2,3 +2,5 @@ wandb
 checkpoints
 cache
 __pycache__
+output
+pretrained_ckpts
