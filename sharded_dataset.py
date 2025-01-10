@@ -1,8 +1,9 @@
 import io
 
 import torch
-from datasets import load_dataset
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
+
+from lavender_data import StreamingLavenderDataset
 
 
 def deserialize_tensor(serialized_tensor: bytes, device=None) -> torch.Tensor:
@@ -13,38 +14,46 @@ def deserialize_tensor(serialized_tensor: bytes, device=None) -> torch.Tensor:
     )
 
 
-class LatentDataset(Dataset):
-    def __init__(self, split="train", cache_dir="./cache"):
-        MS = 1979810 // 2
-        RANGE = range(0, MS - 40) if split == "train" else range(MS - 40, MS)
-
-        self.dataset = load_dataset(
-            "fal/cosmos-openvid-1m", split="train", cache_dir=cache_dir
-        ).select(RANGE)
+class LatentDataset(IterableDataset):
+    def __init__(
+        self,
+        split="train",
+        cache_dir="./cache",
+        shuffle=False,
+        device=None,
+        num_workers=1,
+    ):
+        self.device = device
+        self.dataset = StreamingLavenderDataset(
+            local=cache_dir,
+            remote="hf://huggingface.co/fal/cosmos-openvid-1m/continuous",
+            split=split,
+            queue_size=16,
+            cache_size=256,
+            num_workers=num_workers,
+            shuffle_shards=shuffle,
+            shuffle_samples=shuffle,
+        )
 
     def __len__(self):
         return len(self.dataset)
 
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        latent = deserialize_tensor(item["serialized_latent"], "cpu")
-
-        return {"latent": latent, "prompt": item["caption"]}
+    def __iter__(self):
+        for item in self.dataset:
+            latent = deserialize_tensor(item["serialized_latent"], self.device)
+            yield {"latent": latent, "prompt": item["caption"]}
 
 
 if __name__ == "__main__":
-    dset = LatentDataset(split="test")
+    dset = LatentDataset(split="train", device="cuda")
     print(f"Length: {len(dset)}")
-    print(dset[0])
     # iterate and check the length of the latent tensor
-    for i in range(len(dset)):
-        print(dset[i]["latent"].shape)
+    for data in dset:
+        print(data["latent"].shape)
         # print stats.
         print(
-            dset[i]["latent"].min(),
-            dset[i]["latent"].max(),
-            dset[i]["latent"].mean(),
-            dset[i]["latent"].std(),
+            data["latent"].min(),
+            data["latent"].max(),
+            data["latent"].mean(),
+            data["latent"].std(),
         )
-
-        print(dset[i]["prompt"])

@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import click
@@ -13,6 +14,7 @@ import torch.distributed.checkpoint as dcp
 import torch.optim as optim
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # Enable TF32 for faster training
 torch._inductor.config.coordinate_descent_tuning = True
@@ -22,6 +24,8 @@ torch._inductor.config.fx_graph_cache = True
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+torch.multiprocessing.set_start_method("spawn")
 
 from transformers import (
     get_cosine_schedule_with_warmup,
@@ -73,14 +77,14 @@ def forward(
     vae_latent = images_vae.to(device).to(torch.bfloat16)
 
     with torch.no_grad():
-
-        caption_encoded = encode_prompt_with_t5(
-            text_encoder,
-            tokenizer,
-            prompt=captions,
-            device=device,
-            return_index=return_index,
-        )
+        with record_function("encode_prompt_with_t5"):
+            caption_encoded = encode_prompt_with_t5(
+                text_encoder,
+                tokenizer,
+                prompt=captions,
+                device=device,
+                return_index=return_index,
+            )
         caption_encoded = caption_encoded.to(torch.bfloat16)
 
         do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.01
@@ -116,7 +120,8 @@ def forward(
     z_t = vae_latent * (1 - tr) + noise * tr
     v_objective = vae_latent - noise
 
-    output = dit_model(z_t, caption_encoded, t)
+    with record_function("dit_model"):
+        output = dit_model(z_t, caption_encoded, t)
 
     diffusion_loss_batchwise = (
         (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3, 4))
@@ -212,12 +217,15 @@ def train_fsdp(
 ):
     # Initialize distributed training
     assert torch.cuda.is_available(), "CUDA is required for training"
-    dist.init_process_group(backend="nccl")
+
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
+
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
+
     master_process = ddp_rank == 0
+    dist.init_process_group(backend="nccl", device_id=torch.device(device))
 
     # Set random seeds
     # torch.manual_seed(42)
@@ -267,7 +275,8 @@ def train_fsdp(
         print(f"param_count: {param_count / 1e6}M")
 
     if master_process:
-
+        if os.getenv("WANDB_API_KEY") is not None:
+            wandb.login(key=os.getenv("WANDB_API_KEY"))
         wandb.init(
             project=project_name,
             name=run_name,
@@ -288,7 +297,6 @@ def train_fsdp(
 
     # Move model to CUDA device
 
-    torch.cuda.set_device(device)
     load_via_pt = False
     if load_checkpoint is not None:
         checkpoint_path = Path(load_checkpoint)
@@ -319,7 +327,6 @@ def train_fsdp(
             dist.barrier()
             print(f"Rank {ddp_rank} done loading checkpoint, {status}")
 
-    # print(f"Loaded checkpoint from {load_checkpoint}")
     dit_model = apply_fsdp(
         dit_model, param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
@@ -342,7 +349,6 @@ def train_fsdp(
             betas=(0.95, 0.99),
             fused=True,
         )
-
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
@@ -369,9 +375,17 @@ def train_fsdp(
         num_workers=8,
         do_shuffle=True,
         prefetch_factor=4,
+        device=device,
     )
 
-    test_loader = create_dataloader("test", batch_size, num_workers=1, do_shuffle=False)
+    # test_loader = create_dataloader("test", batch_size, num_workers=1, do_shuffle=False)
+    test_loader = create_dataloader(
+        "train",
+        batch_size,
+        num_workers=1,
+        do_shuffle=False,
+        device=device,
+    )
 
     # Setup logging
     logger = logging.getLogger(__name__)
@@ -409,33 +423,44 @@ def train_fsdp(
             if global_step >= max_steps:
                 break
 
-            total_loss, diffusion_loss = forward(
-                dit_model,
-                batch,
-                text_encoder,
-                tokenizer,
-                device,
-                global_step,
-                master_process,
-                generator=None,
-                binnings=(
-                    diffusion_loss_binning,
-                    diffusion_loss_binning_count,
-                ),
-                batch_size=batch_size,
-                return_index=return_index,
-            )
+            activities = [
+                ProfilerActivity.CPU,
+                ProfilerActivity.CUDA,
+                ProfilerActivity.XPU,
+            ]
 
-            # Optimization step
-            backward_start = time.time()
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            backward_time = time.time() - backward_start
+            with (
+                profile(activities=activities) if master_process else nullcontext()
+            ) as prof:
+                total_loss, diffusion_loss = forward(
+                    dit_model,
+                    batch,
+                    text_encoder,
+                    tokenizer,
+                    device,
+                    global_step,
+                    master_process,
+                    generator=None,
+                    binnings=(
+                        diffusion_loss_binning,
+                        diffusion_loss_binning_count,
+                    ),
+                    batch_size=batch_size,
+                    return_index=return_index,
+                )
+
+                # Optimization step
+                backward_start = time.time()
+                with record_function("backward"):
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
+                    lr_scheduler.step()
+                backward_time = time.time() - backward_start
 
             if master_process:
                 logger.info(f"Backward pass took {backward_time*1000:.2f}ms")
+                # prof.export_chrome_trace(f"trace_{global_step}.json")
 
             # Logging
             if global_step % 10 == 0:

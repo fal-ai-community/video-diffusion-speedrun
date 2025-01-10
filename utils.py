@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -15,8 +16,8 @@ def avg_scalar_across_ranks(scalar):
     return scalar_tensor.item()
 
 
-def create_dataloader(split, batch_size, num_workers, do_shuffle, prefetch_factor=8):
-    dset = LatentDataset(split=split)
+def create_dataloader(split, batch_size, num_workers, do_shuffle, device, prefetch_factor=8):
+    dset = LatentDataset(split=split, shuffle=do_shuffle, num_workers=num_workers, device=device)
 
     def collate_fn(batch):
         return {
@@ -27,9 +28,7 @@ def create_dataloader(split, batch_size, num_workers, do_shuffle, prefetch_facto
     dl = DataLoader(
         dset,
         batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=do_shuffle,
-        prefetch_factor=prefetch_factor,
+        # prefetch_factor=prefetch_factor,
         collate_fn=collate_fn,
     )
     return dl
@@ -85,10 +84,13 @@ def load_encoders(
     text_encoder_path="black-forest-labs/FLUX.1-dev",
     device="cuda",
     compile_models=True,
+    hf_token=os.getenv("HF_TOKEN"),
 ):
 
     tokenizer = T5TokenizerFast.from_pretrained(
-        text_encoder_path, subfolder="tokenizer_2"
+        text_encoder_path,
+        subfolder="tokenizer_2",
+        token=hf_token,
     )
 
     text_encoder = (
@@ -96,6 +98,7 @@ def load_encoders(
             text_encoder_path,
             subfolder="text_encoder_2",
             torch_dtype=torch.bfloat16,
+            token=hf_token,
         )
         .to(device)
         .eval()

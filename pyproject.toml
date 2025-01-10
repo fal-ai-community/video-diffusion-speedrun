@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "video-diffusion-speedrun"
+version = "0.1.0"
+description = ""
+authors = []
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.10"
+lavender-data = {git = "https://github.com/fal-ai/lavender-data.git", subdirectory = "packages/lavender-data"}
+torch = "^2.5.1"
+datasets = "^3.2.0"
+transformers = "^4.47.1"
+wandb = "^0.19.2"
+click = "^8.1.8"
+einops = "^0.8.0"
+sentencepiece = "^0.2.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
