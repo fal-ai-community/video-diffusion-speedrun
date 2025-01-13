@@ -59,11 +59,12 @@ class DiTBlock(nn.Module):
         self.residual_v = residual_v
 
         self.norm1 = RMSNorm(hidden_size, trainable=qkv_bias)
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias)
+        self.chunked_fc = nn.Linear(hidden_size, hidden_size * 8, bias=qkv_bias)
         self.attn_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
         if residual_v:
             self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
+            self.lambda_param_2 = nn.Parameter(torch.tensor(0.5).reshape(1))
 
         if cross_attn_input_size is not None:
             self.norm2 = RMSNorm(hidden_size, trainable=qkv_bias)
@@ -80,11 +81,12 @@ class DiTBlock(nn.Module):
 
         self.norm3 = RMSNorm(hidden_size, trainable=qkv_bias)
         mlp_hidden = int(hidden_size * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden),
-            nn.GELU(),
-            nn.Linear(mlp_hidden, hidden_size),
-        )
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(hidden_size, mlp_hidden),
+        #     nn.GELU(),
+        #     nn.Linear(mlp_hidden, hidden_size),
+        # )
+        self.mlp_proj = nn.Linear(4 * hidden_size, hidden_size, bias=False)
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True)
@@ -122,12 +124,18 @@ class DiTBlock(nn.Module):
         norm_x = self.norm1(x)
         norm_x = norm_x * (1 + scale_sa) + shift_sa
 
-        qkv = self.qkv(norm_x)
+        # qkv = self.qkv(norm_x)
+
+        B, T, C = norm_x.shape
+
+        chunks = self.chunked_fc(norm_x).split([3 * C, 4 * C, C], dim=-1)
+        qkv, mlp_intermediate, cross_q = chunks
+
         qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
         q, k, v = qkv.unbind(0)
 
         if self.residual_v and v_0 is not None:
-            v = self.lambda_param * v + (1 - self.lambda_param) * v_0
+            v = self.lambda_param * v + self.lambda_param_2 * v_0
 
         if rope is not None:
             q = apply_rotary_emb(q, rope[0], rope[1])
@@ -140,12 +148,8 @@ class DiTBlock(nn.Module):
 
         # Cross attention
         if self.norm2 is not None:
-            norm_x = self.norm2(x)
-            norm_x = norm_x * (1 + scale_ca) + shift_ca
 
-            q = rearrange(
-                self.q_cross(norm_x), "b l (h d) -> b h l d", h=self.num_heads
-            )
+            q = rearrange(cross_q, "b l (h d) -> b h l d", h=self.num_heads)
             context_kv = rearrange(
                 self.context_kv(context),
                 "b l (k h d) -> k b h l d",
@@ -159,10 +163,7 @@ class DiTBlock(nn.Module):
             cross_out = self.cross_proj(cross_out)
             x = x + cross_out * gate_ca
 
-        # MLP
-        norm_x = self.norm3(x)
-        norm_x = norm_x * (1 + scale_mlp) + shift_mlp
-        x = x + self.mlp(norm_x) * gate_mlp
+        x = x + self.mlp_proj(nn.SiLU()(mlp_intermediate)) * gate_mlp
 
         return x, v
 
@@ -371,7 +372,7 @@ class DiT(nn.Module):
             ),
         )
 
-        t_emb = timestep_embedding(timesteps, self.hidden_size).to(
+        t_emb = timestep_embedding(timesteps * 1000, self.hidden_size).to(
             x.device, dtype=x.dtype
         )
         t_emb = self.time_embed(t_emb)

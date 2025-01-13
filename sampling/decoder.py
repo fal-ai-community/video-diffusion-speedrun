@@ -62,13 +62,16 @@ if __name__ == "__main__":
     tensor = deserialize_tensor(dataset["train"][0]["serialized_latent"])
 
     # int4 quantize and dequantize back.
-    # tensor = ((tensor.float().clamp(-3, 3) + 3) / 6) # this is [0, 1]
-    # tensor = (tensor * 15.0).long()
+    MAX_VAL = 6.0
+    tensor = (tensor.float().clamp(-MAX_VAL, MAX_VAL) + MAX_VAL) / (
+        2 * MAX_VAL
+    )  # this is [0, 1]
+    tensor = (tensor * 15.0).long()
 
-    # # dequantize back
-    # tensor = tensor.float() / 15.0
-    # tensor = tensor * 6.0 - 3.0
-    # tensor = tensor.bfloat16()
+    # dequantize back
+    tensor = tensor.float() / 15.0
+    tensor = tensor * 2 * MAX_VAL - MAX_VAL
+    tensor = tensor.bfloat16()
 
     print(tensor.shape)
     save_tensor_to_mp4(tensor, decoder, "./output", "test_raw")

@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from transformers import T5EncoderModel, T5TokenizerFast
 
 from sharded_dataset import LatentDataset
+from torch.utils.data import DistributedSampler
 
 torch.set_float32_matmul_precision("high")
 
@@ -28,9 +29,9 @@ def create_dataloader(split, batch_size, num_workers, do_shuffle, prefetch_facto
         dset,
         batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=do_shuffle,
         prefetch_factor=prefetch_factor,
         collate_fn=collate_fn,
+        sampler=DistributedSampler(dset, shuffle=do_shuffle),
     )
     return dl
 
@@ -38,7 +39,7 @@ def create_dataloader(split, batch_size, num_workers, do_shuffle, prefetch_facto
 def encode_prompt_with_t5(
     text_encoder,
     tokenizer,
-    max_sequence_length=512,
+    max_sequence_length=256,
     prompt=None,
     num_images_per_prompt=1,
     device=None,
