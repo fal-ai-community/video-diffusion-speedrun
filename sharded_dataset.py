@@ -16,7 +16,7 @@ def deserialize_tensor(serialized_tensor: bytes, device=None) -> torch.Tensor:
 class LatentDataset(Dataset):
     def __init__(self, split="train", cache_dir="./cache"):
         MS = 1979810 // 2
-        RANGE = range(0, MS - 400) if split == "train" else range(MS - 400, MS)
+        RANGE = range(0, MS - 10) if split == "train" else range(MS - 10, MS)
 
         self.dataset = load_dataset(
             "fal/cosmos-openvid-1m", split="train", cache_dir=cache_dir

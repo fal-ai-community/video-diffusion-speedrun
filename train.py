@@ -217,10 +217,10 @@ def train_fsdp(
     master_process = ddp_rank == 0
 
     # Set random seeds
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
+    np.random.seed(41)
+    random.seed(41)
 
     # Initialize wandb for the master process
 
@@ -338,7 +338,7 @@ def train_fsdp(
 
         optimizer = optim.AdamW(
             optimizer_grouped_parameters,
-            betas=(0.95, 0.99),
+            betas=(0.9, 0.95),
             fused=True,
         )
 
@@ -347,7 +347,7 @@ def train_fsdp(
 
     num_iterations = max_steps
     if lr_scheduler_type == "linear":
-        warmup_iters = 20
+        warmup_iters = int(max_steps * 0.01)
         warmdown_iters = max_steps
     if lr_scheduler_type == "constant":
         warmup_iters = 0
@@ -375,7 +375,7 @@ def train_fsdp(
     train_loader = create_dataloader(
         "train",
         batch_size,
-        num_workers=8,
+        num_workers=4,
         do_shuffle=True,
         prefetch_factor=4,
     )

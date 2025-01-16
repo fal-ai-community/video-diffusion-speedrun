@@ -43,7 +43,7 @@ def init_model(device="cuda", dtype=torch.bfloat16, checkpoint_path=None):
     state_dict = torch.load(temp_path, map_location=device)
     with st.spinner("Loading model..."):
         with torch.device("meta"):
-            dim = 1024
+            dim = 2048
             model = DiT(
                 in_channels=16,
                 patch_size=2,
@@ -185,7 +185,7 @@ def main():
             device = "cuda" if torch.cuda.is_available() else "cpu"
             dtype = torch.bfloat16
 
-            checkpoint_path = "/home/ubuntu/simo/cosmos-video-trainer/checkpoints/new-baseline-large-hs2/30001"
+            checkpoint_path = "/home/ubuntu/simo/cosmos-video-trainer/checkpoints/baseline-large-hs4/67501"
 
             st.session_state.model = init_model(device, dtype, checkpoint_path)
             st.session_state.tokenizer, st.session_state.text_encoder = init_encoders(
