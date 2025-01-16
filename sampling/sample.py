@@ -10,6 +10,7 @@ import sys
 
 sys.path.append("/home/ubuntu/simo/cosmos-video-trainer")
 
+
 from model import (
     DiT,
     timestep_embedding,
@@ -26,6 +27,8 @@ logging.basicConfig(
 
 from decoder import save_tensor_to_mp4
 
+DEFAULT_PROMPT = "The video features a man in a distressed state, lying on the ground with a watch nearby. The man appears to be in a state of emotional turmoil, possibly crying or in pain. The setting is a dimly lit room with a wooden door in the background. The overall style of the video is dramatic and intense, with a focus on the man's emotional state and the surrounding environment. The lighting and composition of the shots suggest a narrative that is centered around the man's experience."
+
 
 # Cache the model initialization
 @st.cache_resource
@@ -40,14 +43,15 @@ def init_model(device="cuda", dtype=torch.bfloat16, checkpoint_path=None):
     state_dict = torch.load(temp_path, map_location=device)
     with st.spinner("Loading model..."):
         with torch.device("meta"):
+            dim = 2048
             model = DiT(
                 in_channels=16,
                 patch_size=2,
                 depth=24,  # Adjust based on your needs
-                num_heads=2048 // 128,  # Calculated from width/head_dim (3072/64)
+                num_heads=dim // 128,  # Calculated from width/head_dim (3072/64)
                 mlp_ratio=4.0,
                 cross_attn_input_size=4096,
-                hidden_size=2048,  # width parameter
+                hidden_size=dim,  # width parameter
                 residual_v=True,
                 train_bias_and_rms=False,
             )
@@ -90,7 +94,7 @@ def generate_image(
 ):
     """Generate image from prompt using the DiT model."""
     torch.set_grad_enabled(False)
-    RET_INDEX = -1
+    RET_INDEX = -8
 
     # Encode prompts
     prompt_embeds = encode_prompt_with_t5(
@@ -134,11 +138,12 @@ def generate_image(
         dt = t - t_next
         t = torch.tensor([t] * 1).to(device, dtype)
         t_next = torch.tensor([t_next] * 1).to(device, dtype)
+        t_curr = torch.tensor([t_curr] * 1).to(device, dtype)
 
         # Predict noise
-        model_output = model(latents, prompt_embeds, t)
+        model_output = model(latents, prompt_embeds, t_curr)
         if cfg_scale > 1:
-            uncond_output = model(latents, negative_embeds, t)
+            uncond_output = model(latents, negative_embeds, t_curr)
             model_output = uncond_output + cfg_scale * (model_output - uncond_output)
 
         # Update latents
@@ -171,7 +176,7 @@ def main():
     width = st.sidebar.number_input("Width", 128, 1024, 512)
 
     # Main interface
-    prompt = st.text_area("Enter your prompt:", height=100)
+    prompt = st.text_area("Enter your prompt:", value=DEFAULT_PROMPT, height=100)
     do_enhance = st.checkbox("Enhance prompt", value=True)
 
     # Initialize models if not already cached
@@ -180,9 +185,7 @@ def main():
             device = "cuda" if torch.cuda.is_available() else "cpu"
             dtype = torch.bfloat16
 
-            checkpoint_path = (
-                "/home/ubuntu/simo/cosmos-video-trainer/checkpoints/run3/16001"
-            )
+            checkpoint_path = "/home/ubuntu/simo/cosmos-video-trainer/checkpoints/baseline-large-hs4/67501"
 
             st.session_state.model = init_model(device, dtype, checkpoint_path)
             st.session_state.tokenizer, st.session_state.text_encoder = init_encoders(

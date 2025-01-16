@@ -5,6 +5,7 @@ import os
 import time
 from pathlib import Path
 
+import random
 import click
 import numpy as np
 import torch
@@ -22,11 +23,6 @@ torch._inductor.config.fx_graph_cache = True
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
-from transformers import (
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-)
 
 import wandb
 from model import DiT, apply_fsdp
@@ -91,6 +87,7 @@ def forward(
         batch_size, device=device, dtype=torch.bfloat16, generator=generator
     )
     t = torch.nn.Sigmoid()(z)
+    t_unscaled = t.clone()
     # time shift
     alpha = 8.0
     t = t * alpha / (1 + (alpha - 1) * t)
@@ -116,7 +113,7 @@ def forward(
     z_t = vae_latent * (1 - tr) + noise * tr
     v_objective = vae_latent - noise
 
-    output = dit_model(z_t, caption_encoded, t)
+    output = dit_model(z_t, caption_encoded, t_unscaled)
 
     diffusion_loss_batchwise = (
         (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3, 4))
@@ -220,10 +217,10 @@ def train_fsdp(
     master_process = ddp_rank == 0
 
     # Set random seeds
-    # torch.manual_seed(42)
-    # torch.cuda.manual_seed(42)
-    # np.random.seed(42)
-    # random.seed(42)
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
+    np.random.seed(41)
+    random.seed(41)
 
     # Initialize wandb for the master process
 
@@ -283,6 +280,8 @@ def train_fsdp(
             },
         )
 
+        wandb.run.log_code(".")
+
     # Wrap model in FSDP
     constant_param_name = ["patch_proj", "context_kv", "positional_embedding"]
 
@@ -339,34 +338,44 @@ def train_fsdp(
 
         optimizer = optim.AdamW(
             optimizer_grouped_parameters,
-            betas=(0.95, 0.99),
+            betas=(0.9, 0.95),
             fused=True,
         )
 
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
-    num_warmup_steps = 20
+    num_iterations = max_steps
+    if lr_scheduler_type == "linear":
+        warmup_iters = int(max_steps * 0.01)
+        warmdown_iters = max_steps
+    if lr_scheduler_type == "constant":
+        warmup_iters = 0
+        warmdown_iters = 0
+    if lr_scheduler_type == "power":
+        warmup_iters = 200
+        warmdown_iters = max_steps
 
-    if lr_scheduler_type == "cosine":
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps, max_steps
-        )
-    elif lr_scheduler_type == "linear":
-        lr_scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps, max_steps
-        )
-    elif lr_scheduler_type == "constant":
-        lr_scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps, 10000000000
-        )
-    else:
-        raise ValueError(f"Unknown lr scheduler type: {lr_scheduler_type}")
+    def get_wsd_lr(it):
+        if it < warmup_iters:
+            return it / warmup_iters
+        if it > num_iterations - warmdown_iters:
+            return (num_iterations - it) / warmdown_iters
+        return 1
+
+    def get_power_lr(it):
+        if it < warmup_iters:
+            return it / warmup_iters
+        return (it + 1 - warmup_iters) ** -0.5
+
+    lr_lambda = get_wsd_lr if lr_scheduler_type == "linear" else get_power_lr
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     train_loader = create_dataloader(
         "train",
         batch_size,
-        num_workers=8,
+        num_workers=4,
         do_shuffle=True,
         prefetch_factor=4,
     )
@@ -574,6 +583,7 @@ def train_fsdp(
                             "test/total_loss": total_loss,
                             "test/diffusion_loss": diffusion_loss,
                             "test_binning/diffusion_loss_binning": stats,
+                            f"test/total_loss_step_{global_step}": total_loss,
                         }
                     )
                     print(f"Binned Losses: {stats}")
