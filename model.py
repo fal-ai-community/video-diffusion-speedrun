@@ -486,7 +486,7 @@ def get_device_mesh():
     if dp_replicate >= 1:
         dims.append(dp_replicate)
         names.append("dp_replicate")
-    if dp_shard > 1 or distributed_args.fsdp_type == "no_shard":
+    if dp_shard > 1:
         dims.append(dp_shard)
         names.append("dp_shard")
     if tp_size > 1:

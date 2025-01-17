@@ -85,7 +85,7 @@ def load_encoders(
     text_encoder_path="black-forest-labs/FLUX.1-dev",
     device="cuda",
     compile_models=True,
-    hf_token=os.getenv("HF_TOKEN"),
+    hf_token=os.getenv("HF_HUB_TOKEN"),
 ):
 
     tokenizer = T5TokenizerFast.from_pretrained(
