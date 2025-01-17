@@ -1,4 +1,6 @@
 import io
+from string import ascii_letters
+from random import randint, choice
 
 import torch
 from torch.utils.data import IterableDataset
@@ -43,6 +45,15 @@ class LatentDataset(IterableDataset):
             latent = deserialize_tensor(item["serialized_latent"], self.device)
             yield {"latent": latent, "prompt": item["caption"]}
 
+class FakeDataset(IterableDataset):
+    def __init__(self, *a, **k): pass
+    def __len__(self): return 9999999
+    def __iter__(self):
+        for _ in range(len(self)):
+            yield dict(
+                latent=torch.randn(16,16,64,64,device='cuda'),
+                prompt=''.join(choice(ascii_letters) for _ in range(randint(16,64))),
+            )
 
 if __name__ == "__main__":
     dset = LatentDataset(split="train", device="cuda")

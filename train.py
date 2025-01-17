@@ -151,6 +151,7 @@ def forward(
 
 
 @click.command()
+@click.option("--dataset", type=click.Choice(["real", "fake"]), default="real", help="Dataset to use")
 @click.option("--num_epochs", type=int, default=2, help="Number of training epochs")
 @click.option("--batch_size", type=int, default=64, help="Batch size for training")
 @click.option("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -197,6 +198,7 @@ def forward(
     help="Path to checkpoint to load",
 )
 def train_fsdp(
+    dataset,
     num_epochs,
     batch_size,
     learning_rate,
@@ -370,6 +372,7 @@ def train_fsdp(
         raise ValueError(f"Unknown lr scheduler type: {lr_scheduler_type}")
 
     train_loader = create_dataloader(
+        dataset,
         "train",
         batch_size,
         num_workers=8,
@@ -378,9 +381,9 @@ def train_fsdp(
         device=device,
     )
 
-    # test_loader = create_dataloader("test", batch_size, num_workers=1, do_shuffle=False)
     test_loader = create_dataloader(
-        "train",
+        dataset,
+        "train", # test
         batch_size,
         num_workers=1,
         do_shuffle=False,

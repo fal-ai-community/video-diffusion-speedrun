@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import T5EncoderModel, T5TokenizerFast
 
-from sharded_dataset import LatentDataset
+from sharded_dataset import LatentDataset, FakeDataset
 
 torch.set_float32_matmul_precision("high")
 
@@ -16,8 +16,9 @@ def avg_scalar_across_ranks(scalar):
     return scalar_tensor.item()
 
 
-def create_dataloader(split, batch_size, num_workers, do_shuffle, device, prefetch_factor=8):
-    dset = LatentDataset(split=split, shuffle=do_shuffle, num_workers=num_workers, device=device)
+def create_dataloader(dataset, split, batch_size, num_workers, do_shuffle, device, prefetch_factor=8):
+    cls = dict(real=LatentDataset, fake=FakeDataset)[dataset]
+    dset = cls(split=split, shuffle=do_shuffle, num_workers=num_workers, device=device)
 
     def collate_fn(batch):
         return {
