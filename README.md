@@ -1,18 +1,22 @@
 # OpenVid Diffusion
 
-## Training
+## Install
+### local
+`uv sync`
 
-Download dataset first. 
+`uv pip install git+ssh://git@github.com/fal-ai/lavender-data.git` if you want to use the real dataset
 
-```python
-python download.py
-```
+### Docker
+tbd
 
-Run training script.
 
-```bash
-bash run_debug.sh
-```
+## Run
+A `HF_HUB_TOKEN` with read access to `black-forest-labs/FLUX.1-dev` is required
+
+### Single node 8 gpu
+`HF_HUB_TOKEN=... ./test.sh`
+
+---
 
 Streamlit Demo:
 

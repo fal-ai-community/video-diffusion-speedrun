@@ -1,23 +1,29 @@
-[tool.poetry]
+[project]
 name = "video-diffusion-speedrun"
 version = "0.1.0"
 description = ""
 authors = []
+requires-python = "~=3.10"
 readme = "README.md"
-package-mode = false
+dependencies = [
+    # "lavender-data", # optional
+    "torch>=2.5.1,<3",
+    "datasets>=3.2.0,<4",
+    "transformers>=4.47.1,<5",
+    "wandb>=0.19.2,<0.20",
+    "click>=8.1.8,<9",
+    "einops>=0.8.0,<0.9",
+    "sentencepiece>=0.2.0,<0.3",
+    "py-spy>=0.4.0",
+    "lovely-tensors>=0.1.18",
+]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-lavender-data = {git = "https://github.com/fal-ai/lavender-data.git", subdirectory = "packages/lavender-data"}
-torch = "^2.5.1"
-datasets = "^3.2.0"
-transformers = "^4.47.1"
-wandb = "^0.19.2"
-click = "^8.1.8"
-einops = "^0.8.0"
-sentencepiece = "^0.2.0"
+[tool.uv]
+package = false
 
+[tool.uv.sources]
+lavender-data = { git = "git+ssh://mhgh/fal-ai/lavender-data.git", subdirectory = "packages/lavender-data" }
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
