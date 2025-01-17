@@ -5,8 +5,10 @@ from random import randint, choice
 import torch
 from torch.utils.data import IterableDataset
 
-from lavender_data import StreamingLavenderDataset
-
+try: from lavender_data import StreamingLavenderDataset
+except ImportError:
+    def StreamingLavenderDataset(*a, **k):
+        raise RuntimeError("lavender_data is not installed.")
 
 def deserialize_tensor(serialized_tensor: bytes, device=None) -> torch.Tensor:
     return torch.load(

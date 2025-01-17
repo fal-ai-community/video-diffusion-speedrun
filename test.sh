@@ -6,7 +6,7 @@ lr=0.0003
 compile=False
 dataset=fake
 
-[ -z "$HF_HUB_TOKEN" ] && echo "HF_HUB_TOKEN is not set" && exit 1
+[ -z "$HF_HUB_TOKEN" ] && echo "warning: HF_HUB_TOKEN is not set"
 [ -z "$HF_HOME" ] && echo "warning: HF_HOME is not set"
 export HF_HUB_USE_HF_TRANSFER=1
 export WANDB_MODE=offline
