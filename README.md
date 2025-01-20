@@ -4,14 +4,24 @@
 
 #### Build
 Run this command with a `HF_HUB_TOKEN` that has access to `black-forest-labs/FLUX.1-dev`:
-`DOCKER_BUILDKIT=1 docker build --secret id=hf_token,env=HF_HUB_TOKEN . -t video-diffusion`
+
+`./build.sh`
+
+This builds an image (`video-diffusion:latest`) and saves it to `video-diffusion.tar`.
 
 #### Run (1node)
 Execute small model on a fake dataset:
-`docker run --gpus all --rm -it video-diffusion`
+`./docker-wrap.sh`
 
 #### Run (8node)
-TBD
+To load the image on all nodes, run something like:
+```bash
+srun --nodes 8 --exclusive docker load -i /nfs/path/to/video-diffusion.tar
+```
+Then, you can execute:
+```bash
+srun --nodes 8 --exclusive ./docker-wrap.sh
+```
 
 ## local
 ### install

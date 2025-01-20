@@ -27,6 +27,6 @@ RUN --mount=type=secret,id=hf_token,required=true \
     --local-dir /app/black-forest-labs/FLUX.1-dev \
     --include tokenizer_2/ text_encoder_2/ -- black-forest-labs/FLUX.1-dev
 
-COPY model.py sharded_dataset.py train.py utils.py test.sh ./
+COPY model.py sharded_dataset.py train.py utils.py test.sh slurm.sh build.sh ./
 
-CMD ["uv", "run", "/app/test.sh"]
+CMD ["uv", "run"]

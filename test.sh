@@ -1,6 +1,6 @@
 #!/bin/bash
 L=8
-D=512
+D=4096
 bs=2
 lr=0.0003
 compile=False
@@ -11,11 +11,17 @@ dataset=fake
 export HF_HUB_USE_HF_TRANSFER=1
 export WANDB_MODE=offline
 
-# FileNotFoundError: [Errno 2] No such file or directory: './cache/train/continuous/train/index.json' -> './cache/train/index.json'
 . .venv/bin/activate
-OMP_NUM_THREADS=32 torchrun --nproc_per_node=8 train.py \
+export OMP_NUM_THREADS=32
+
+if [ -z "$SLURM_JOB_ID" ]
+then cmd='torchrun --nproc_per_node=8 train.py'
+else cmd='./slurm.sh'
+fi
+
+$cmd \
     --batch_size $bs \
-    --run_name lr${lr}_width512 \
+    --run_name lr${lr}_width$D \
     --num_epochs 100 \
     --learning_rate ${lr} \
     --max_steps 5004 \
@@ -28,3 +34,7 @@ OMP_NUM_THREADS=32 torchrun --nproc_per_node=8 train.py \
     --project_name openvid-diffusion-ci \
     --dataset $dataset \
     --compile_models $compile
+
+# todo: fix
+# FileNotFoundError: [Errno 2] No such file or directory: './cache/train/continuous/train/index.json' -> './cache/train/index.json'
+# for real dataset on first invokation
