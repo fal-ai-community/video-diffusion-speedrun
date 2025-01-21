@@ -41,7 +41,7 @@ class DiTBlock(nn.Module):
     def __init__(
         self,
         hidden_size,
-        cross_attn_input_size,
+        cross_attn_input_size: None | int,
         num_heads,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -192,9 +192,9 @@ class ThreeDimRotary(torch.nn.Module):
         this_t, this_h, this_w = time_height_width
 
         # randomly, we augment the height and width
-        start_t = self.rng.randint(0, self.t - this_t + 1)
-        start_h = self.rng.randint(0, self.h - this_h + 1)
-        start_w = self.rng.randint(0, self.w - this_w + 1)
+        start_t = self.rng.randint(0, self.t - this_t)
+        start_h = self.rng.randint(0, self.h - this_h)
+        start_w = self.rng.randint(0, self.w - this_w)
 
         cos = self.freqs_hwt_cos[
             start_t : start_t + this_t,
