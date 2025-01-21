@@ -22,25 +22,6 @@ def timestep_embedding(t, dim, max_period=10000):
     return embedding
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6, trainable=False):
-        super().__init__()
-        self.eps = eps
-        if trainable:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.weight = None
-
-    def forward(self, x):
-        x_dtype = x.dtype
-        x = x.float()
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        if self.weight is not None:
-            return (x * norm * self.weight).to(dtype=x_dtype)
-        else:
-            return (x * norm).to(dtype=x_dtype)
-
-
 class DiTBlock(nn.Module):
     def __init__(
         self,
@@ -58,7 +39,7 @@ class DiTBlock(nn.Module):
         self.scale = self.head_dim**-0.5
         self.residual_v = residual_v
 
-        self.norm1 = RMSNorm(hidden_size, trainable=qkv_bias)
+        self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
         self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias)
         self.attn_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
@@ -66,7 +47,7 @@ class DiTBlock(nn.Module):
             self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
 
         if cross_attn_input_size is not None:
-            self.norm2 = RMSNorm(hidden_size, trainable=qkv_bias)
+            self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
             self.q_cross = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
             self.context_kv = nn.Linear(
                 cross_attn_input_size, hidden_size * 2, bias=qkv_bias
@@ -78,7 +59,7 @@ class DiTBlock(nn.Module):
             self.context_kv = None
             self.cross_proj = None
 
-        self.norm3 = RMSNorm(hidden_size, trainable=qkv_bias)
+        self.norm3 = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
         mlp_hidden = int(hidden_size * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden),
@@ -340,7 +321,7 @@ class DiT(nn.Module):
             nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-        self.final_norm = RMSNorm(hidden_size, trainable=train_bias_and_rms)
+        self.final_norm = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=train_bias_and_rms)
         self.final_proj = nn.Linear(
             hidden_size, patch_size * patch_size * time_patch_size * self.out_channels
         )
