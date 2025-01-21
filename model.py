@@ -500,24 +500,70 @@ def apply_fsdp(dit_model, param_dtype, reduce_dtype):
     return dit_model
 
 
+### fwd-bwd profiling code (deleteme later) ###
+
+def create_dummy(d=1024,l=16): return DiT(
+    in_channels=16,
+    patch_size=2,
+    hidden_size=d,
+    depth=l,
+    num_heads=d // 128,
+    cross_attn_input_size=4096,
+    mlp_ratio=4.0,
+    residual_v=True,
+    train_bias_and_rms=False, #???
+    use_rope=True,
+)
+
+def fakeinput(bs: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.randn(bs, 16, 16, 64, 64), torch.randn(bs, 128, 4096), torch.rand(bs)
+
+def rank(): return dist.get_rank() if dist.is_initialized() else 0
+
+__import__("lovely_tensors").monkey_patch()
+from contextlib import contextmanager
+from pathlib import Path
+from tqdm import tqdm
+from torch.profiler import schedule, profile, ProfilerActivity, record_function
+
+def tqdm_with_step(prof: profile, iters: int, **k):
+    for i in tqdm(range(iters)):
+        yield i
+        prof.step()
+
+@contextmanager
+def profiler_setup(path_ct: Path, iters: int):
+    """Sets up profiler and yields a generator to iterate over"""
+    path_ct.mkdir(parents=True, exist_ok=True)
+    sched = schedule(skip_first=10, wait=5, warmup=1, active=3, repeat=3)
+    activ = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+    # kwarg = dict(record_shapes=True, profile_memory=True, with_stack=True)
+    kwarg = dict(with_stack=True)
+    def handler(p: profile):
+        p.export_chrome_trace(str(path_ct / f"rank-{rank()}_step-{p.step_num}.json"))
+
+    with profile(activities=activ, schedule=sched, on_trace_ready=handler, **kwarg) as prof:
+        yield tqdm_with_step(prof, iters)
+
+def bench(comp: bool):
+    B, D, L = 2, 4096, 4
+    # spawn model
+    m = create_dummy(D, L)
+    if comp:
+        m = torch.compile(m, fullgraph=True)
+    # inp = fakeinput(B)
+    # m(*inp, rope=m.get_rope(inp[0].shape)).sum().backward()
+    # if comp: m.apply_compile(True)
+    # pre-generate all inputs, then convert to iterator
+    # inputs = [fakeinput(B) for _ in range(32)]
+    with profiler_setup(Path(f'./chrometrace-{D}-{comp=}'), 30) as g:
+        for i in g:
+            inp = fakeinput(B)
+            torch.cuda.synchronize()
+            with record_function("fwd"): o = m(*inp, rope=m.get_rope(inp[0].shape))
+            with record_function("bwd"): o.sum().backward()
+            for p in m.parameters(): p.grad = None
+
 if __name__ == "__main__":
-    model = DiT(
-        in_channels=4,
-        patch_size=2,
-        time_patch_size=2,
-        hidden_size=512,
-        depth=28,
-        num_heads=16,
-        mlp_ratio=4.0,
-        cross_attn_input_size=128,
-        residual_v=False,
-        train_bias_and_rms=True,
-        use_rope=True,
-    ).cuda()
-    print(
-        model(
-            torch.randn(1, 4, 64, 64, 64).cuda(),
-            torch.randn(1, 37, 128).cuda(),
-            torch.tensor([1.0]).cuda(),
-        ).shape
-    )
+    with torch.device('cuda'), torch.autocast('cuda', torch.bfloat16):
+        bench(True)
