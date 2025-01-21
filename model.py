@@ -6,9 +6,10 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from torch import nn
+from torch import nn, Tensor as TT
 
 
+# TODO: cache freqs
 def timestep_embedding(t, dim, max_period=10000):
     half = dim // 2
     freqs = torch.exp(
@@ -21,6 +22,19 @@ def timestep_embedding(t, dim, max_period=10000):
 
     return embedding
 
+class Modulation(nn.Sequential):
+    def __init__(self, d: int, n: int):
+        super().__init__(nn.SiLU(), nn.Linear(d, n * d, bias=True))
+        self.n = n
+    def reset_parameters(self):
+        nn.init.zeros_(self[-1].weight)
+        nn.init.zeros_(self[-1].bias)
+    def forward(self, c: TT) -> tuple[TT, ...]:
+        return super().forward(c).chunk(self.n, dim=-1)
+
+class ModulatedRMSNorm(nn.RMSNorm):
+    def forward(self, x: TT, shift: TT, scale: TT) -> TT:
+        return super().forward(x) * (1 + scale) + shift
 
 class DiTBlock(nn.Module):
     def __init__(
@@ -39,15 +53,16 @@ class DiTBlock(nn.Module):
         self.scale = self.head_dim**-0.5
         self.residual_v = residual_v
 
-        self.norm1 = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
+        self.norm1 = ModulatedRMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
         self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias)
         self.attn_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
         if residual_v:
             self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
 
+        # TODO: reduce footprint
         if cross_attn_input_size is not None:
-            self.norm2 = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
+            self.norm2 = ModulatedRMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
             self.q_cross = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
             self.context_kv = nn.Linear(
                 cross_attn_input_size, hidden_size * 2, bias=qkv_bias
@@ -59,50 +74,23 @@ class DiTBlock(nn.Module):
             self.context_kv = None
             self.cross_proj = None
 
-        self.norm3 = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
+        self.norm3 = ModulatedRMSNorm(hidden_size, eps=1e-6, elementwise_affine=qkv_bias)
         mlp_hidden = int(hidden_size * mlp_ratio)
+        # TODO: this probably doesn't need biases
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden),
             nn.GELU(),
             nn.Linear(mlp_hidden, hidden_size),
         )
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True)
-        )
-
-        self.adaLN_modulation[-1].weight.data.zero_()
-        self.adaLN_modulation[-1].bias.data.zero_()
+        self.adaLN_modulation = Modulation(hidden_size, 6 if cross_attn_input_size is None else 9)
+        self.adaLN_modulation.reset_parameters()
 
     def forward(self, x, context, c, v_0=None, rope=None):
-        (
-            shift_sa,
-            scale_sa,
-            gate_sa,
-            shift_ca,
-            scale_ca,
-            gate_ca,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaLN_modulation(c).chunk(9, dim=1)
-
-        scale_sa = scale_sa[:, None, :]
-        scale_ca = scale_ca[:, None, :]
-        scale_mlp = scale_mlp[:, None, :]
-
-        shift_sa = shift_sa[:, None, :]
-        shift_ca = shift_ca[:, None, :]
-        shift_mlp = shift_mlp[:, None, :]
-
-        gate_sa = gate_sa[:, None, :]
-        gate_ca = gate_ca[:, None, :]
-        gate_mlp = gate_mlp[:, None, :]
+        shift_sa, scale_sa, gate_sa, *mod_ca, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c[:,None])
 
         # Self attention
-        norm_x = self.norm1(x)
-        norm_x = norm_x * (1 + scale_sa) + shift_sa
-
+        norm_x = self.norm1(x, shift_sa, scale_sa)
         qkv = self.qkv(norm_x)
         qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
         q, k, v = qkv.unbind(0)
@@ -121,8 +109,8 @@ class DiTBlock(nn.Module):
 
         # Cross attention
         if self.norm2 is not None:
-            norm_x = self.norm2(x)
-            norm_x = norm_x * (1 + scale_ca) + shift_ca
+            shift_ca, scale_ca, gate_ca = mod_ca
+            norm_x = self.norm2(x, shift_ca, scale_ca)
 
             q = rearrange(
                 self.q_cross(norm_x), "b l (h d) -> b h l d", h=self.num_heads
@@ -141,13 +129,13 @@ class DiTBlock(nn.Module):
             x = x + cross_out * gate_ca
 
         # MLP
-        norm_x = self.norm3(x)
-        norm_x = norm_x * (1 + scale_mlp) + shift_mlp
+        norm_x = self.norm3(x, shift_mlp, scale_mlp)
         x = x + self.mlp(norm_x) * gate_mlp
 
         return x, v
 
 
+# TODO: simplify me
 class PatchEmbed(nn.Module):
     def __init__(self, patch_size=16, in_channels=3, embed_dim=768, time_patch_size=16):
         super().__init__()
