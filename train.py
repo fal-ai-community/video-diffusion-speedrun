@@ -119,9 +119,10 @@ def forward(
     tr = t.reshape(batch_size, 1, 1, 1, 1)
     z_t = vae_latent * (1 - tr) + noise * tr
     v_objective = vae_latent - noise
+    rope = dit_model.get_rope(z_t.shape)
 
     with record_function("dit_model"):
-        output = dit_model(z_t, caption_encoded, t)
+        output = dit_model(z_t, caption_encoded, t, rope=rope)
 
     diffusion_loss_batchwise = (
         (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3, 4))

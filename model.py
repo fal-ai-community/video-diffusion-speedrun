@@ -307,14 +307,13 @@ class DiT(nn.Module):
                 "requires_grad": p.requires_grad,
             }
 
-    def forward(self, x, context, timesteps):
-        b, c, t, h, w = x.shape
-        x = self.patch_embed(x)  # b, T, d
 
-        x = torch.cat([self.register_tokens.repeat(b, 1, 1), x], 1)  # b, T + N, d
-
-        cos, sin = self.rope(
-            x,
+    # segregated method for 2 reasons:
+    # 1. uncompilable
+    # 2. needed in train loop for CP API
+    def get_rope(self, x_shape):
+        b, c, t, h, w = x_shape
+        return self.rope(
             extend_with_register_tokens=16,
             time_height_width=(
                 t // self.time_patch_size,
@@ -322,6 +321,13 @@ class DiT(nn.Module):
                 w // self.patch_size,
             ),
         )
+
+    def forward(self, x, context, timesteps, rope: tuple[TT,TT]):
+        # TODO: document shapes and reduce useless ops here...
+        b, c, t, h, w = x.shape
+        x = self.patch_embed(x)  # b, T, d
+
+        x = torch.cat([self.register_tokens.repeat(b, 1, 1), x], 1)  # b, T + N, d
 
         t_emb = timestep_embedding(timesteps, self.hidden_size).to(
             x.device, dtype=x.dtype
@@ -331,7 +337,7 @@ class DiT(nn.Module):
         v_0 = None
 
         for idx, block in enumerate(self.blocks):
-            x, v = block(x, context, t_emb, v_0=v_0, rope=(cos, sin))
+            x, v = block(x, context, t_emb, v_0=v_0, rope=rope)
             if v_0 is None:
                 v_0 = v
 
