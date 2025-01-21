@@ -1,5 +1,6 @@
 # DiT with cross attention
 
+import random
 import math
 from collections import defaultdict
 
@@ -184,54 +185,40 @@ class ThreeDimRotary(torch.nn.Module):
 
         self.register_buffer("freqs_hwt_cos", freqs_hwt.cos())
         self.register_buffer("freqs_hwt_sin", freqs_hwt.sin())
+        self.rng = random.Random()
 
-    def forward(self, x, time_height_width=None, extend_with_register_tokens=0):
-
+    def forward(self, time_height_width, extend_with_register_tokens=0):
+        # TODO: write kernel because in principle these are static shapes
         this_t, this_h, this_w = time_height_width
 
         # randomly, we augment the height and width
-        start_h = torch.randint(0, self.h - this_h + 1, (1,)).item()
-        start_w = torch.randint(0, self.w - this_w + 1, (1,)).item()
-        start_t = torch.randint(0, self.t - this_t + 1, (1,)).item()
+        start_t = self.rng.randint(0, self.t - this_t + 1)
+        start_h = self.rng.randint(0, self.h - this_h + 1)
+        start_w = self.rng.randint(0, self.w - this_w + 1)
 
         cos = self.freqs_hwt_cos[
             start_t : start_t + this_t,
             start_h : start_h + this_h,
             start_w : start_w + this_w,
-        ]
+        ].flatten(0,-2)
         sin = self.freqs_hwt_sin[
             start_t : start_t + this_t,
             start_h : start_h + this_h,
             start_w : start_w + this_w,
-        ]
-
-        cos = cos.clone().reshape(this_h * this_w * this_t, -1)
-        sin = sin.clone().reshape(this_h * this_w * this_t, -1)
+        ].flatten(0,-2)
 
         # append N of zero-attn tokens
-        if extend_with_register_tokens > 0:
-            cos = torch.cat(
-                [
-                    torch.ones(extend_with_register_tokens, cos.shape[1]).to(
-                        cos.device
-                    ),
-                    cos,
-                ],
-                0,
-            )
-            sin = torch.cat(
-                [
-                    torch.zeros(extend_with_register_tokens, sin.shape[1]).to(
-                        sin.device
-                    ),
-                    sin,
-                ],
-                0,
-            )
+        cos = torch.cat([
+            torch.ones(extend_with_register_tokens, cos.shape[-1], device=cos.device),
+            cos,
+        ])
+        sin = torch.cat([
+            torch.ones(extend_with_register_tokens, sin.shape[-1], device=sin.device),
+            sin,
+        ])
+        return cos[None, None], sin[None, None]  # [1, 1, T + N, Attn-dim]
 
-        return cos[None, None, :, :], sin[None, None, :, :]  # [1, 1, T + N, Attn-dim]
-
-
+# TODO: check efficiency
 def apply_rotary_emb(x, cos, sin):
     orig_dtype = x.dtype
     x = x.to(dtype=torch.float32)
@@ -269,18 +256,14 @@ class DiT(nn.Module):
         self.num_heads = num_heads
         self.depth = depth
         self.mlp_ratio = mlp_ratio
-        self.use_rope = use_rope
+        assert use_rope, "rope is required"
 
         self.patch_embed = PatchEmbed(
             patch_size, in_channels, hidden_size, time_patch_size
         )
-
-        if self.use_rope:
-            self.rope = ThreeDimRotary(
-                hidden_size // (2 * num_heads), h=128, w=128, t=128
-            )
-        else:
-            self.positional_embedding = nn.Parameter(torch.zeros(1, 2048, hidden_size))
+        self.rope = ThreeDimRotary(
+            hidden_size // (2 * num_heads), h=128, w=128, t=128
+        )
 
         self.register_tokens = nn.Parameter(torch.randn(1, 16, hidden_size))
 
