@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn, Tensor as TT
+import torch._dynamo as _D
 
 
 # TODO: cache freqs
@@ -135,7 +136,6 @@ class DiTBlock(nn.Module):
 
         return x, v
 
-
 # TODO: simplify me
 class PatchEmbed(nn.Module):
     def __init__(self, patch_size=16, in_channels=3, embed_dim=768, time_patch_size=16):
@@ -230,6 +230,35 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).to(dtype=orig_dtype)
 
+class DiTStack(nn.ModuleList):
+    # wrapper module containing DiT blocks. useful for input conversion to/from DTensor.
+    def __init__(self, d: int, l: int, *, n_heads: int, r_mlp: float, xattn_dim: int, residual_v: bool, qkv_bias: bool):
+        super().__init__([
+            DiTBlock(
+                hidden_size=d,
+                num_heads=n_heads,
+                mlp_ratio=r_mlp,
+                cross_attn_input_size=xattn_dim,
+                residual_v=residual_v,
+                qkv_bias=qkv_bias,
+            )
+            for _ in range(l)
+        ])
+        self.seqlen_bounds = dict(min=8192, max=32768) # inclusive
+    def forward(self, x: TT, c: TT, t: TT, rope: tuple[TT,TT]):
+        if _D.config.dynamic_shapes:
+            # Unfortunately, dynamo doesn't support negative dim indices,
+            # so we use 1/2 instead of -2 (which is reliably seq dim)
+            _D.mark_dynamic(x, 1, **self.seqlen_bounds)
+            _D.mark_dynamic(rope[0], 2, **self.seqlen_bounds)
+            _D.mark_dynamic(rope[1], 2, **self.seqlen_bounds)
+
+        v_0 = None
+        for i, block in enumerate(self):
+            x, v = block(x, c, t, v_0=v_0, rope=rope)
+            if v_0 is None:
+                v_0 = v
+        return x, v_0
 
 class DiT(nn.Module):
     def __init__(
@@ -273,20 +302,14 @@ class DiT(nn.Module):
             nn.Linear(4 * hidden_size, hidden_size),
         )
 
-        self.blocks = nn.ModuleList(
-            [
-                DiTBlock(
-                    hidden_size=hidden_size,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    cross_attn_input_size=cross_attn_input_size,
-                    residual_v=residual_v,
-                    qkv_bias=train_bias_and_rms,
-                )
-                for _ in range(depth)
-            ]
+        self.blocks = DiTStack(
+            hidden_size, depth,
+            n_heads=num_heads,
+            r_mlp=mlp_ratio,
+            xattn_dim=cross_attn_input_size,
+            residual_v=residual_v,
+            qkv_bias=train_bias_and_rms,
         )
-        self.depth = depth
 
         self.final_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -307,6 +330,10 @@ class DiT(nn.Module):
                 "requires_grad": p.requires_grad,
             }
 
+    def apply_compile(self, fullgraph: bool, dynamic: bool | None=None):
+        for i, block in enumerate(self.blocks):
+            if isinstance(block, DiTBlock):
+                self.blocks[i] = torch.compile(block, fullgraph=fullgraph, dynamic=dynamic)
 
     # segregated method for 2 reasons:
     # 1. uncompilable
@@ -334,12 +361,7 @@ class DiT(nn.Module):
         )
         t_emb = self.time_embed(t_emb)
 
-        v_0 = None
-
-        for idx, block in enumerate(self.blocks):
-            x, v = block(x, context, t_emb, v_0=v_0, rope=rope)
-            if v_0 is None:
-                v_0 = v
+        x, _ = self.blocks(x, context, t_emb, rope=rope)
 
         x = x[:, 16:, :]
         final_shift, final_scale = self.final_modulation(t_emb).chunk(2, dim=1)
