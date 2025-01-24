@@ -3,7 +3,7 @@ L=8
 D=4096
 bs=2
 lr=0.0003
-compile=False
+compile=True
 dataset=fake
 
 [ -z "$HF_HUB_TOKEN" ] && echo "warning: HF_HUB_TOKEN is not set"
