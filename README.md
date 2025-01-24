@@ -24,10 +24,10 @@ srun --nodes 8 --exclusive ./docker-wrap.sh
 ```
 
 ## local
-### install
-`uv sync`
+You need configured ssh `git@github.com` access to install `lavender-data`.
 
-`uv pip install git+ssh://git@github.com/fal-ai/lavender-data.git` if you want to use the real dataset
+### install
+`uv sync` should work. Failing that, `uv pip install -e .[lavender-data]`.
 
 ### Run
 A `HF_HUB_TOKEN` with read access to `black-forest-labs/FLUX.1-dev` is required
