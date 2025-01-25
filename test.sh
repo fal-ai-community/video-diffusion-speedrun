@@ -20,6 +20,7 @@ else cmd='./slurm.sh'
 fi
 
 $cmd \
+    --fs 8 --cp 1 \
     --batch_size $bs \
     --run_name lr${lr}_width$D \
     --num_epochs 100 \

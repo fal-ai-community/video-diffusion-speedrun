@@ -14,6 +14,7 @@ import torch.distributed.device_mesh as tdm
 import torch.distributed.checkpoint as dcp
 import torch.optim as optim
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.tensor.experimental import context_parallel, _attention, implicit_replication
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
@@ -29,13 +30,16 @@ torch.backends.cudnn.allow_tf32 = True
 
 torch.multiprocessing.set_start_method("spawn")
 
+# As of Dec 2024, non-causal CP is broken-by-default unless this flag is set.
+_attention._cp_options.enable_load_balance = False
+
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
 
 import wandb
-from model import DiT, apply_fsdp
+from model import DiT
 from utils import (
     avg_scalar_across_ranks,
     create_dataloader,
@@ -192,19 +196,6 @@ def forward(
     )
 
     diffusion_loss = diffusion_loss_batchwise.mean()
-
-    # # timestep binning
-    # tbins = [int(_t * 10) for _t in t]
-
-    # if binnings is not None:
-    #     (
-    #         diffusion_loss_binning,
-    #         diffusion_loss_binning_count,
-    #     ) = binnings
-    #     for idx, tb in enumerate(tbins):
-    #         diffusion_loss_binning[tb] += diffusion_loss_batchwise[idx].item()
-    #         diffusion_loss_binning_count[tb] += 1
-
     total_loss = diffusion_loss
 
     forward_time = time.time() - forward_start
@@ -347,7 +338,7 @@ def train_fsdp(
         if load_checkpoint is not None:
             load_ckpt(dit_model, Path(load_checkpoint), master_process)
 
-        dit_model = apply_fsdp(dit_model, mesh["dp", "fscp"])
+        apply_fsdp(dit_model, mesh["dp", "fscp"])
 
 
     if master_process:
@@ -475,13 +466,10 @@ def train_fsdp(
 
 
     for epoch in range(num_epochs):
-        if global_step >= max_steps:
-            break
+        if global_step >= max_steps: break
 
         for batch_idx, batch in enumerate(train_loader):
-
-            if global_step >= max_steps:
-                break
+            if global_step >= max_steps: break
 
             total_loss, diffusion_loss = forward(
                 dit_model,
