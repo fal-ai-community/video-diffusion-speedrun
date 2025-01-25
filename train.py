@@ -45,6 +45,7 @@ from utils import (
     create_dataloader,
     encode_prompt_with_t5,
     load_encoders,
+    limited_tqdm,
 )
 
 CAPTURE_INPUT = False
@@ -128,7 +129,6 @@ def forward(
     global_step,
     master_process,
     generator=None,
-    binnings=None,
     batch_size=None,
     return_index=-1,
 ):

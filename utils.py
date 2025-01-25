@@ -1,5 +1,6 @@
 import os
 from functools import reduce
+from tqdm import tqdm
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -9,6 +10,11 @@ from sharded_dataset import LatentDataset, FakeDataset
 
 torch.set_float32_matmul_precision("high")
 
+def limited_tqdm(it, total=9999999):
+    for i, x in enumerate(tqdm(it, total=total)):
+        yield x
+        if i >= total: return
+    print(f"WARNING: iterator {it} exhausted before {total=} steps.")
 
 def get_module(module, access_string):
     names = access_string.split(sep=".")
@@ -22,7 +28,6 @@ def set_module(module, access_string, value):
 
 
 def avg_scalar_across_ranks(scalar):
-    world_size = dist.get_world_size()
     scalar_tensor = torch.tensor(scalar, device="cuda")
     dist.all_reduce(scalar_tensor, op=dist.ReduceOp.AVG)
     return scalar_tensor.item()
