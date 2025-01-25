@@ -43,6 +43,7 @@ import wandb
 from model import DiT
 from utils import (
     avg_scalar_across_ranks,
+    async_allgather_stack,
     create_dataloader,
     encode_prompt_with_t5,
     load_encoders,
@@ -137,11 +138,13 @@ def prompt2context(text_encoder, tokenizer, captions, device, return_index=-1):
     caption_encoded[do_zero_out] = 0
     return caption_encoded
 
-def forward(
+def forward_plusmaybe_backward(
+    mesh_cp: tdm.DeviceMesh,
     dit_model: DiT,
     vae_latent: torch.Tensor,
     caption_encoded: torch.Tensor,
     timeit_r0: callable,
+    backward: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with timeit_r0("preprocess"), torch.device("cuda"):
         batch_size = vae_latent.size(0)
@@ -153,28 +156,45 @@ def forward(
         t = t * alpha / (1 + (alpha - 1) * t)
 
         noise = torch.randn_like(vae_latent)
-
-    with timeit_r0("forward"):
         tr = t.reshape(batch_size, 1, 1, 1, 1)
         z_t = vae_latent * (1 - tr) + noise * tr
         v_objective = vae_latent - noise
         rope = dit_model.get_rope(z_t.shape)
 
-        with record_function("dit_model"):
-            '''
-            tensor[2, 16, 16, 64, 64] bf16 n=2097152 (4Mb) x∈[-4.344, 4.562] μ=2.933e-05 σ=0.898 cuda:0
-            tensor[2, 512, 4096] bf16 n=4194304 (8Mb) x∈[-0.898, 2.031] μ=0.001 σ=0.070 cuda:0
-            tensor[2] bf16 μ=0.891 σ=0.033 cuda:0 [0.914, 0.867]
-            (tensor[1, 1, 8208, 64] n=525312 (2.0Mb) x∈[-1.000, 1.000] μ=0.064 σ=0.690 cuda:0, tensor[1, 1, 8208, 64] n=525312 (2.0Mb) x∈[-1.000, 1.000] μ=0.228 σ=0.686 cuda:0)
-            '''
+    '''print(z_t, caption_encoded, t, rope)
+    tensor[2, 16, 16, 64, 64] bf16 n=2097152 (4Mb) x∈[-4.344, 4.562] μ=2.933e-05 σ=0.898 cuda:0
+    tensor[2, 512, 4096] bf16 n=4194304 (8Mb) x∈[-0.898, 2.031] μ=0.001 σ=0.070 cuda:0
+    tensor[2] bf16 μ=0.891 σ=0.033 cuda:0 [0.914, 0.867]
+    (tensor[1, 1, 8208, 64] n=525312 (2.0Mb) x∈[-1.000, 1.000] μ=0.064 σ=0.690 cuda:0, tensor[1, 1, 8208, 64] n=525312 (2.0Mb) x∈[-1.000, 1.000] μ=0.228 σ=0.686 cuda:0)
+
+    Note on context parallelism:
+    1. it *must* be wrapped around both fwd + bwd to be correct.
+    2. if it is used in training, it is almost certainly desired in inference as well.
+    3. it *cannot* be activated during T5 encoding, otherwise it might trip HF usage of sdpa.
+    so, we use it here.
+
+    With regards to sequence dim partitioning,
+    1. we split noise/velocity on time dimension, -3. in the general case,
+       I aim to split on the lastmost effective sequence dim, to ensure sdpa gets valid split chunks
+    2. the caption is also used in sdpa (xattn), so it must be split by its own seqlen.
+    3. rope is directly applied to q/k, so it must also be seq split'd
+    See printed shapes above && buffer_seq_dims below for cross-checking.
+
+    We don't restore any buffers because they aren't needed, generally.
+    '''
+    with context_parallel(
+        mesh_cp,
+        buffers=[z_t, v_objective, caption_encoded, rope[0], rope[1]],
+        buffer_seq_dims=[-3, -3, -2, -2, -2],
+        no_restore_buffers={z_t, v_objective, caption_encoded, rope[0], rope[1]},
+    ) if mesh_cp.size(0) > 1 else nullcontext():
+        with timeit_r0("forward"), record_function("forward"):
             output = dit_model(z_t, caption_encoded, t, rope=rope)
-
-        diffusion_loss_batchwise = (
-            (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3, 4))
-        )
-
-        diffusion_loss = diffusion_loss_batchwise.mean()
-        total_loss = diffusion_loss
+            diffusion_loss = (v_objective.float() - output.float()).pow(2).mean()
+            total_loss = diffusion_loss
+        if backward:
+            with timeit_r0("bwd"), record_function("backward"):
+                total_loss.backward()
 
     return total_loss, diffusion_loss
 
@@ -444,6 +464,16 @@ def train_fsdp(
         for e in range(num_epochs):
             for i, d in enumerate(train_loader):
                 x, c = d['latent'].cuda(), d['prompt']
+
+                # TODO: have a replication PG in LavenderStreamingDataset.
+                if mesh['data_gather'].size(0) != 1:
+                    gather_pg = mesh['data_gather'].get_group()
+                    x = async_allgather_stack(x, gather_pg).flatten(end_dim=1)
+                    prompts = [None] * gather_pg.size()
+                    dist.all_gather_object(prompts, c, group=gather_pg)
+                    c = [p for ls in prompts for p in ls]
+                # gathering this way defeats the entire point of CP, it's just a demonstration.
+
                 yield (e,step), (x,c)
                 step += 1
                 if step >= max_steps: return
@@ -451,15 +481,11 @@ def train_fsdp(
     time_for_10_steps = time.time()
     for (epoch, step), (x, c) in multiepoch_loop():
         e = prompt2context(text_encoder, tokenizer, c, device, return_index=-1)
-        total_loss, diffusion_loss = forward(dit_model, x, e, timeit_r0)
-
-        with timeit_r0("bwd+optim"):
-            with record_function("backward"):
-                total_loss.backward()
-            with record_function("optim"):
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+        total_loss, diffusion_loss = forward_plusmaybe_backward(mesh['cp'], dit_model, x, e, timeit_r0, backward=True)
+        with timeit_r0("optim/lr"):
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
         # Logging
         if step % 10 == 0:
@@ -498,7 +524,7 @@ def train_fsdp(
                 torch.manual_seed(ddp_rank)
                 for batch_idx, batch in limited_tqdm(enumerate(test_loader), total=9):
                     e = prompt2context(text_encoder, tokenizer, batch["prompt"], device, return_index=-1)
-                    total_loss, diffusion_loss = forward(dit_model, batch["latent"], e, timeit_r0)
+                    total_loss, diffusion_loss = forward_plusmaybe_backward(mesh['cp'], dit_model, batch["latent"], e, timeit_r0, backward=False)
                     total_losses.append(total_loss.item())
                     diffusion_losses.append(diffusion_loss.item())
 

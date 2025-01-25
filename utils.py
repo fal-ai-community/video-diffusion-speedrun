@@ -31,6 +31,10 @@ def timeit(name: str="", print_fn = print):
     start[0] = time.time() - start[0]
     print_fn(f"[{name}] {start[0]*1000:.2f}ms")
 
+def async_allgather_stack(t: torch.Tensor, gather_pg: dist.ProcessGroup) -> torch.Tensor:
+    out = torch.empty(gather_pg.size(), *t.shape, dtype=t.dtype, device=t.device).flatten(end_dim=1)
+    handle = dist.all_gather_into_tensor(out, t, group=gather_pg, async_op=True)
+    return lambda: (handle.wait(),out)[-1]
 
 def limited_tqdm(it, total=9999999):
     for i, x in enumerate(tqdm(it, total=total)):
