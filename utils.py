@@ -1,4 +1,6 @@
 import os
+import time
+from contextlib import contextmanager
 from functools import reduce
 from tqdm import tqdm
 import torch
@@ -9,6 +11,26 @@ from transformers import T5EncoderModel, T5TokenizerFast
 from sharded_dataset import LatentDataset, FakeDataset
 
 torch.set_float32_matmul_precision("high")
+
+@contextmanager
+def timeit(name: str="", print_fn = print):
+    """Context manager for timing code blocks.
+    
+    Args:
+        name (str): Optional name for the timed block
+        print_fn (callable): Function used for printing the timing output
+
+    Example:
+        with timeit("my op", lambda x:0) as t:
+            # code to time
+            ...
+        my_op_time = t[0]
+    """
+    start = [time.time()]
+    yield start
+    start[0] = time.time() - start[0]
+    print_fn(f"[{name}] {start[0]*1000:.2f}ms")
+
 
 def limited_tqdm(it, total=9999999):
     for i, x in enumerate(tqdm(it, total=total)):

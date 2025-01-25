@@ -18,6 +18,7 @@ from torch.distributed.tensor.experimental import context_parallel, _attention, 
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 # Enable TF32 for faster training
 torch._inductor.config.coordinate_descent_tuning = True
@@ -46,6 +47,7 @@ from utils import (
     encode_prompt_with_t5,
     load_encoders,
     limited_tqdm,
+    timeit,
 )
 
 
@@ -119,81 +121,60 @@ def ceil_to_multiple(x, multiple):
     return math.ceil(x / multiple) * multiple
 
 
+@torch.no_grad()
+def prompt2context(text_encoder, tokenizer, captions, device, return_index=-1):
+    with record_function("encode_prompt_with_t5"):
+        caption_encoded = encode_prompt_with_t5(
+            text_encoder,
+            tokenizer,
+            prompt=captions,
+            device=device,
+            return_index=return_index,
+        )
+    caption_encoded = caption_encoded.to(torch.bfloat16)
+
+    do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.01
+    caption_encoded[do_zero_out] = 0
+    return caption_encoded
+
 def forward(
     dit_model: DiT,
-    batch,
-    text_encoder,
-    tokenizer,
-    device,
-    master_process,
-    generator=None,
-    batch_size=None,
-    return_index=-1,
-):
-    logger = logging.getLogger(__name__)
+    vae_latent: torch.Tensor,
+    caption_encoded: torch.Tensor,
+    timeit_r0: callable,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with timeit_r0("preprocess"), torch.device("cuda"):
+        batch_size = vae_latent.size(0)
+        dtype = vae_latent.dtype
+        z = torch.randn(batch_size, dtype=dtype)
+        t = torch.nn.functional.sigmoid(z)
+        # time shift
+        alpha = 8.0
+        t = t * alpha / (1 + (alpha - 1) * t)
 
-    captions = batch["prompt"]
+        noise = torch.randn_like(vae_latent)
 
-    images_vae = batch["latent"]
+    with timeit_r0("forward"):
+        tr = t.reshape(batch_size, 1, 1, 1, 1)
+        z_t = vae_latent * (1 - tr) + noise * tr
+        v_objective = vae_latent - noise
+        rope = dit_model.get_rope(z_t.shape)
 
-    # print(captions, images_vae.shape)
+        with record_function("dit_model"):
+            '''
+            tensor[2, 16, 16, 64, 64] bf16 n=2097152 (4Mb) x∈[-4.344, 4.562] μ=2.933e-05 σ=0.898 cuda:0
+            tensor[2, 512, 4096] bf16 n=4194304 (8Mb) x∈[-0.898, 2.031] μ=0.001 σ=0.070 cuda:0
+            tensor[2] bf16 μ=0.891 σ=0.033 cuda:0 [0.914, 0.867]
+            (tensor[1, 1, 8208, 64] n=525312 (2.0Mb) x∈[-1.000, 1.000] μ=0.064 σ=0.690 cuda:0, tensor[1, 1, 8208, 64] n=525312 (2.0Mb) x∈[-1.000, 1.000] μ=0.228 σ=0.686 cuda:0)
+            '''
+            output = dit_model(z_t, caption_encoded, t, rope=rope)
 
-    preprocess_start = time.time()
-    vae_latent = images_vae.to(device).to(torch.bfloat16)
+        diffusion_loss_batchwise = (
+            (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3, 4))
+        )
 
-    with torch.no_grad():
-        with record_function("encode_prompt_with_t5"):
-            caption_encoded = encode_prompt_with_t5(
-                text_encoder,
-                tokenizer,
-                prompt=captions,
-                device=device,
-                return_index=return_index,
-            )
-        caption_encoded = caption_encoded.to(torch.bfloat16)
-
-        do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.01
-        caption_encoded[do_zero_out] = 0
-
-    batch_size = vae_latent.size(0)
-    z = torch.randn(
-        batch_size, device=device, dtype=torch.bfloat16, generator=generator
-    )
-    t = torch.nn.Sigmoid()(z)
-    # time shift
-    alpha = 8.0
-    t = t * alpha / (1 + (alpha - 1) * t)
-
-    noise = torch.randn(
-        vae_latent.shape, device=device, dtype=torch.bfloat16, generator=generator
-    )
-
-    preprocess_time = time.time() - preprocess_start
-
-    if master_process:
-        logger.info(f"Preprocessing took {preprocess_time*1000:.2f}ms")
-
-    forward_start = time.time()
-
-    # Forward pass
-    tr = t.reshape(batch_size, 1, 1, 1, 1)
-    z_t = vae_latent * (1 - tr) + noise * tr
-    v_objective = vae_latent - noise
-    rope = dit_model.get_rope(z_t.shape)
-
-    with record_function("dit_model"):
-        output = dit_model(z_t, caption_encoded, t, rope=rope)
-
-    diffusion_loss_batchwise = (
-        (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3, 4))
-    )
-
-    diffusion_loss = diffusion_loss_batchwise.mean()
-    total_loss = diffusion_loss
-
-    forward_time = time.time() - forward_start
-    if master_process:
-        logger.info(f"Forward pass took {forward_time*1000:.2f}ms")
+        diffusion_loss = diffusion_loss_batchwise.mean()
+        total_loss = diffusion_loss
 
     return total_loss, diffusion_loss
 
@@ -291,6 +272,19 @@ def train_fsdp(
     torch.cuda.set_device(device := f"cuda:{ddp_local_rank}")
     mesh, master_process = create_mesh(fs=fs, cp=cp)
 
+    # init logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    if master_process:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    print_fn = (lambda x: logger.info(x)) if master_process else (lambda _:0)
+    timeit_r0 = lambda s: timeit(s, print_fn=print_fn)
+
     tokenizer, text_encoder = load_encoders(device=device, compile_models=compile_strat == "full")
     model_conf = dict(
         in_channels=16,
@@ -305,7 +299,7 @@ def train_fsdp(
         use_rope=True,
     )
 
-    with torch.device('cuda'), torch.random.fork_rng(['cuda']):
+    with torch.device('cuda'), torch.random.fork_rng(['cuda']), timeit_r0("init model"):
         # *All ranks* receive the same starting seed for param initialization.
         torch.manual_seed(0)
 
@@ -418,18 +412,6 @@ def train_fsdp(
         device=device,
     )
 
-    # Setup logging
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-
-    if master_process:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
     # Training loop
     dit_model.train()
 
@@ -452,9 +434,12 @@ def train_fsdp(
     else:
         prof = type('',(),dict(step=lambda:0))
 
-
-    for epoch in range(num_epochs):
-
+    '''sdp cudnn backend not working:
+    [rank0]:   File "/tmp/torchinductor_ubuntu/m4/cm4svcidkqacmkfbaxf7wnrenhwjmcknezqjleka54t3tpp4wydk.py", line 1439, in call
+    [rank0]:     assert_size_stride(getitem_23, (1, 4, 8208, 128), (4202496, 1050624, 128, 1))
+    [rank0]: AssertionError: expected size 4==4, stride 128==1050624 at dim=1; expected size 8208==8208, stride 512==128 at dim=2
+    # with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+    '''
     def multiepoch_loop(*, step = 0):
         for e in range(num_epochs):
             for i, d in enumerate(train_loader):
@@ -465,29 +450,16 @@ def train_fsdp(
 
     time_for_10_steps = time.time()
     for (epoch, step), (x, c) in multiepoch_loop():
-        total_loss, diffusion_loss = forward(
-            dit_model,
-            dict(latent=x, prompt=c),
-            text_encoder,
-            tokenizer,
-            device,
-            master_process,
-            generator=None,
-            batch_size=batch_size,
-            return_index=return_index,
-        )
-        # Optimization step
-        backward_start = time.time()
-        with record_function("backward"):
-            total_loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
-        backward_time = time.time() - backward_start
+        e = prompt2context(text_encoder, tokenizer, c, device, return_index=-1)
+        total_loss, diffusion_loss = forward(dit_model, x, e, timeit_r0)
 
-        if master_process:
-            logger.info(f"Backward pass took {backward_time*1000:.2f}ms")
-            prof.step()
+        with timeit_r0("bwd+optim"):
+            with record_function("backward"):
+                total_loss.backward()
+            with record_function("optim"):
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
         # Logging
         if step % 10 == 0:
@@ -517,25 +489,16 @@ def train_fsdp(
 
         if step % evaluate_every == 0:
             ## Evaluation ##
-            generator = torch.Generator(device=device).manual_seed(ddp_rank)
             dit_model.eval()
 
             # (Evaluation loop) #
             total_losses = []
             diffusion_losses = []
-            for batch_idx, batch in limited_tqdm(enumerate(test_loader), total=9):
-                with torch.no_grad():
-                    total_loss, diffusion_loss = forward(
-                        dit_model,
-                        batch,
-                        text_encoder,
-                        tokenizer,
-                        device,
-                        master_process,
-                        generator,
-                        return_index=return_index,
-                    )
-
+            with torch.random.fork_rng(['cuda']), torch.no_grad():
+                torch.manual_seed(ddp_rank)
+                for batch_idx, batch in limited_tqdm(enumerate(test_loader), total=9):
+                    e = prompt2context(text_encoder, tokenizer, batch["prompt"], device, return_index=-1)
+                    total_loss, diffusion_loss = forward(dit_model, batch["latent"], e, timeit_r0)
                     total_losses.append(total_loss.item())
                     diffusion_losses.append(diffusion_loss.item())
 
