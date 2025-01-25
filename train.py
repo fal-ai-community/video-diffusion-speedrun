@@ -310,7 +310,7 @@ def train_fsdp(
         )
 
     # Wrap model in FSDP
-    constant_param_name = ["patch_proj", "context_kv", "positional_embedding"]
+    constant_param_name = ["patch_embed", "context_kv", "positional_embedding"]
 
     # Move model to CUDA device
 

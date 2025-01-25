@@ -136,26 +136,18 @@ class DiTBlock(nn.Module):
 
         return x, v
 
-# TODO: simplify me
-class PatchEmbed(nn.Module):
+class PatchEmbed(nn.Conv3d):
     def __init__(self, patch_size=16, in_channels=3, embed_dim=768, time_patch_size=16):
-        super().__init__()
-        self.patch_proj = nn.Conv3d(
+        super().__init__(
             in_channels,
             embed_dim,
             kernel_size=(time_patch_size, patch_size, patch_size),
             stride=(time_patch_size, patch_size, patch_size),
         )
-        self.patch_size = patch_size
-        self.time_patch_size = time_patch_size
+    def forward(self, x: TT):
+        return rearrange(super().forward(x), "b c t h w -> b (h w t) c")
 
-    def forward(self, x):
-        B, C, T, H, W = x.shape
-        x = self.patch_proj(x)
-        x = rearrange(x, "b c t h w -> b (h w t) c")
-        return x
-
-
+# TODO: comprehend 3d RoPE correctly so that I don't mess up CP.
 class ThreeDimRotary(torch.nn.Module):
     def __init__(self, dim, base=100, h=128, w=128, t=128):
         super().__init__()
