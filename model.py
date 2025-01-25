@@ -324,6 +324,31 @@ class DiT(nn.Module):
                 "requires_grad": p.requires_grad,
             }
 
+    """A note on compilation:
+    The fundamental reason why full torch compilation always takes ridiculously long, is because
+    Dynamo *has* to trace the full execution graph for correctness; there is no way to inform
+    the compiler that each block repeats the same code in every circumstance
+    (and in fact, we do not, because of value residuals!)
+
+    Torchtitan side-steps this problem by doing per-transformer-block compilation, which
+    1. allows dynamo to cache work && only do compilation work for 1 fwd/bwd block.
+    2. avoids extra work done in attempting to trace FSDP/DDP comms (which happen per block),
+       and instead simply lets them execute in eager.
+    3. still provides 90% of performance gains from compilation, because >95% of flops are in blocks.
+
+    The above strategy is great for a pure LLM, but a typical diffusion model does significant
+    work outside of the pure transformer.
+    Leaving timestep emb, encoder, convs, rope, flow objective, etc. out of compile is not a good idea.
+    Also, we want to support dynamic shapes without recompilation w/ `mark_dynamic`, but this is
+    much harder to pull off with full model compilation, because [slack mentioned poor tracing].
+
+    So, the actual compilation approach currently looks like this:
+    - By default, we always compile each DiTBlock to be fullgraph, with dynamic marked inputs.
+      We also *try* to compile 3dRoPE, but random shape augmentations are non-fullgraphable.
+    - If 'full' compilation is specified, we compile the full DiT module, *but*
+      we gate the transformer backbone with a torch.compiler.disable(recursive=False).
+      We also compile T5 externally in train.py.
+    """
     def apply_compile(self, fullgraph: bool, dynamic: bool | None=None):
         for i, block in enumerate(self.blocks):
             if isinstance(block, DiTBlock):
@@ -534,8 +559,8 @@ def create_dummy(d=1024,l=16): return DiT(
     use_rope=True,
 )
 
-def fakeinput(bs: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.randn(bs, 16, 16, 64, 64), torch.randn(bs, 128, 4096), torch.rand(bs)
+def fakeinput(bs: int, c: int=16, t: int=16, h: int=64, w: int=64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.randn(bs, c, t, h, w), torch.randn(bs, 512, 4096), torch.rand(bs)
 
 def rank(): return dist.get_rank() if dist.is_initialized() else 0
 
@@ -564,20 +589,19 @@ def profiler_setup(path_ct: Path, iters: int):
     with profile(activities=activ, schedule=sched, on_trace_ready=handler, **kwarg) as prof:
         yield tqdm_with_step(prof, iters)
 
-def bench(comp: bool):
+def bench(comp: bool, dshapes: bool):
     B, D, L = 2, 4096, 4
     # spawn model
     m = create_dummy(D, L)
     if comp:
-        m = torch.compile(m, fullgraph=True)
-    # inp = fakeinput(B)
-    # m(*inp, rope=m.get_rope(inp[0].shape)).sum().backward()
-    # if comp: m.apply_compile(True)
-    # pre-generate all inputs, then convert to iterator
-    # inputs = [fakeinput(B) for _ in range(32)]
-    with profiler_setup(Path(f'./chrometrace-{D}-{comp=}'), 30) as g:
+        m = torch.compile(m)
+        m.apply_compile(True, dynamic=None if dshapes else False)
+
+    # if comp: m.apply_compile(True, dynamic=None if dshapes else False)
+    _D.config.dynamic_shapes = dshapes
+    with profiler_setup(Path(f'./chrometrace-{dshapes=}-{D}-{comp=}'), 30) as g:
         for i in g:
-            inp = fakeinput(B)
+            inp = fakeinput(B, h=64 if i%2 else 128)
             torch.cuda.synchronize()
             with record_function("fwd"): o = m(*inp, rope=m.get_rope(inp[0].shape))
             with record_function("bwd"): o.sum().backward()
@@ -585,4 +609,4 @@ def bench(comp: bool):
 
 if __name__ == "__main__":
     with torch.device('cuda'), torch.autocast('cuda', torch.bfloat16):
-        bench(True)
+        bench(True, True)

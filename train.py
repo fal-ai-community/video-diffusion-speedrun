@@ -222,7 +222,7 @@ def train_fsdp(
     model_width,
     model_depth,
     model_head_dim,
-    compile_models,
+    compile_strat,
     optimizer_type,
     lr_scheduler_type,
     train_bias_and_rms,
