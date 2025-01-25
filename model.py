@@ -467,84 +467,11 @@ class DiT(nn.Module):
         return optimizer_grouped_parameters, final_optimizer_settings
 
 
-from functools import reduce
 
-import torch.distributed as dist
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.device_mesh import init_device_mesh
-
-
-def get_device_mesh():
-    tp_size = 1
-    dp_replicate = 1
-    dp_shard = dist.get_world_size()
-
-    assert (
-        dp_replicate * dp_shard * tp_size == dist.get_world_size()
-    ), f"dp_replicate * dp_shard * tp_size ({dp_replicate} * {dp_shard} * {tp_size}) != world_size ({dist.get_world_size()})"
-
-    dims = []
-    names = []
-    if dp_replicate >= 1:
-        dims.append(dp_replicate)
-        names.append("dp_replicate")
-    if dp_shard > 1:
-        dims.append(dp_shard)
-        names.append("dp_shard")
-    if tp_size > 1:
-        dims.append(tp_size)
-        names.append("tp")
-    dims = tuple(dims)
-    names = tuple(names)
-
-    return init_device_mesh("cuda", mesh_shape=dims, mesh_dim_names=names)
-
-
-def get_module(module, access_string):
-    names = access_string.split(sep=".")
-    return reduce(getattr, names, module)
-
-
-def set_module(module, access_string, value):
-    names = access_string.split(sep=".")
-    parent = reduce(getattr, names[:-1], module)
-    setattr(parent, names[-1], value)
-
-
-def apply_fsdp(dit_model, param_dtype, reduce_dtype):
-
-    device_mesh = get_device_mesh()
-    fsdp_config = {
-        "mp_policy": MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-        ),
-        "mesh": device_mesh["dp_shard"],
-    }
-
-    for block_idx, block in enumerate(dit_model.blocks):
-
-        reshard_after_forward = block_idx < len(dit_model.blocks) - 1
-
-        set_module(
-            dit_model,
-            f"blocks.{block_idx}",
-            fully_shard(
-                block, **fsdp_config, reshard_after_forward=reshard_after_forward
-            ),
-        )
-
-        # fully_shard(
-        #     block, **fsdp_config, reshard_after_forward=False
-        # )
-
-        # Wrap the entire block
-
-    dit_model = fully_shard(dit_model, **fsdp_config, reshard_after_forward=True)
-    return dit_model
 
 
 ### fwd-bwd profiling code (deleteme later) ###
+import torch.distributed as dist
 
 def create_dummy(d=1024,l=16): return DiT(
     in_channels=16,

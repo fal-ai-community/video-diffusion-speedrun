@@ -1,4 +1,5 @@
 import os
+from functools import reduce
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -7,6 +8,17 @@ from transformers import T5EncoderModel, T5TokenizerFast
 from sharded_dataset import LatentDataset, FakeDataset
 
 torch.set_float32_matmul_precision("high")
+
+
+def get_module(module, access_string):
+    names = access_string.split(sep=".")
+    return reduce(getattr, names, module)
+
+
+def set_module(module, access_string, value):
+    names = access_string.split(sep=".")
+    parent = reduce(getattr, names[:-1], module)
+    setattr(parent, names[-1], value)
 
 
 def avg_scalar_across_ranks(scalar):

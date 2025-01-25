@@ -10,8 +10,10 @@ import click
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed.device_mesh as tdm
 import torch.distributed.checkpoint as dcp
 import torch.optim as optim
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
@@ -43,6 +45,67 @@ from utils import (
 
 CAPTURE_INPUT = False
 
+
+def create_mesh(fs: int, cp: int) -> tuple[tdm.DeviceMesh, bool]:
+    # Create a 6D mesh of appropriate dims, and also return the logging rank.
+    ep = pp = tp = 1 # hardcoded unsupported parallelisms
+    minsize = fs * cp * pp * tp * ep
+    ws = int(os.environ['WORLD_SIZE'])
+    dp, remainder = divmod(ws, minsize)
+    assert remainder == 0, f"world size {ws} must be divisible by {minsize}"
+
+    # According to the llama3 paper, mesh hierarchy should be TP->CP->PP->DP,
+    # but IMO it makes more sense as TP->(EP)->CP->(FS)DP->PP.
+    names = ['pp', 'dp', 'fs', 'cp', 'ep', 'tp']
+    sizes = [pp, dp, fs, cp, ep, tp]
+    mesh = tdm.init_device_mesh('cuda', sizes, mesh_dim_names=names)
+
+    # We always pass FSDP2 a 2D [dp, fscp] mesh,
+    mesh['fs','cp']._flatten(mesh_dim_name="fscp")
+    # but the data sharding mesh is different -- only [dp, fs, ep] receives different shards of data.
+    mesh['dp', 'fs']._flatten(mesh_dim_name="data_unique")
+    mesh['cp']._flatten(mesh_dim_name="data_gather")
+
+    # our logging is based on rlast rather than r0, which is helpful for PP.
+    is_rlast = all(mesh[k].get_local_rank() == mesh[k].size(0) - 1 for k in names)
+    return mesh, is_rlast
+
+def apply_fsdp(model: DiT, fsdp_mesh: tdm.DeviceMesh):
+    conf = dict(
+        # use bf16 for param + reduce dtype.
+        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, cast_forward_inputs=True),
+        reshard_after_forward=False, # force zero2 for now
+        mesh=fsdp_mesh,
+        shard_placement_fn=None, # <-- changeme for MoE later.
+    )
+    # torch._dynamo.config.skip_fsdp_hooks = True
+    for block in model.blocks:
+        fully_shard(block, **conf)
+    fully_shard(model, **conf)
+
+def load_ckpt(m: DiT, checkpoint_path: Path, master_process: bool, *, load_via_pt = True):
+    '''
+    Simple rules to avoid wasting time on checkpoint reformatting and etc:
+    1. always load and save in identical world size
+    2. always load and save with identical parallelism
+    3. always load and save in either eager only, or compiled only.
+       There is a trick to hide _orig_mod from module entities that I may use in the future.
+    '''
+    # TODO: reimplement me without wasting time on dense ckpt
+    assert load_via_pt, "only pt loading is supported for now"
+
+    if master_process:
+        if not os.path.exists(checkpoint_path / "temp.pt"):
+            dcp_to_torch_save(checkpoint_path, checkpoint_path / "temp.pt")
+
+    dist.barrier()
+    state_dict = torch.load(checkpoint_path / "temp.pt", mmap=True, map_location="cuda")
+    status = m.load_state_dict(state_dict, assign=True, strict=False)
+    del state_dict
+
+    dist.barrier()
+    if master_process:
+        print(f"All ranks done loading checkpoint, {status}")
 
 def cleanup():
     dist.destroy_process_group()
@@ -152,6 +215,8 @@ def forward(
 
 
 @click.command()
+@click.option("--fs", type=int, default=1, help="fsdp2 (z2) shard factor")
+@click.option("--cp", type=int, default=1, help="context parallel shard factor")
 @click.option("--dataset", type=click.Choice(["real", "fake"]), default="real", help="Dataset to use")
 @click.option("--num_epochs", type=int, default=2, help="Number of training epochs")
 @click.option("--batch_size", type=int, default=64, help="Batch size for training")
@@ -212,6 +277,8 @@ and use *eager* if actively debugging modelling code.
     help="Path to checkpoint to load",
 )
 def train_fsdp(
+    fs,
+    cp,
     dataset,
     num_epochs,
     batch_size,
@@ -233,29 +300,15 @@ def train_fsdp(
     load_checkpoint,
 ):
     # Initialize distributed training
-    assert torch.cuda.is_available(), "CUDA is required for training"
-
+    assert int(os.environ["WORLD_SIZE"]) > 1, "trainer doesn't handle single GPU"
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
-
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(device)
-
-    master_process = ddp_rank == 0
-    dist.init_process_group(backend="nccl", device_id=torch.device(device))
-
-    # Set random seeds
-    # torch.manual_seed(42)
-    # torch.cuda.manual_seed(42)
-    # np.random.seed(42)
-    # random.seed(42)
-
-    # Initialize wandb for the master process
+    
+    torch.cuda.set_device(device := f"cuda:{ddp_local_rank}")
+    mesh, master_process = create_mesh(fs=fs, cp=cp)
 
     tokenizer, text_encoder = load_encoders(device=device, compile_models=compile_strat == "full")
-
-    # with torch.device("meta" if load_checkpoint is not None else device):
-    dit_model = DiT(
+    model_conf = dict(
         in_channels=16,
         patch_size=2,
         depth=model_depth,
@@ -268,14 +321,34 @@ def train_fsdp(
         use_rope=True,
     )
 
-    # initialize 2d params with normal fan_in
-    for name, param in dit_model.named_parameters():
-        # check if param is 2d
-        if len(param.shape) == 2:
-            fan_in = param.shape[1]
-            param.data.mul_(init_std_factor)
+    with torch.device('cuda'), torch.random.fork_rng(['cuda']):
+        # *All ranks* receive the same starting seed for param initialization.
+        torch.manual_seed(0)
 
-    param_count = sum(p.numel() for p in dit_model.parameters())
+        # initialize single-device on cuda. this is cheap and shouldn't be done at larger scale.
+        dit_model = DiT(**model_conf).train()
+        # TODO: ask simo how this is supposed to work. isn't default kaiming uniform?
+        # initialize 2d params with normal fan_in
+        for _, param in dit_model.named_parameters():
+            if len(param.shape) == 2:
+                fan_in = param.shape[1]
+                param.data.mul_(init_std_factor)
+
+        model_size = sum(p.numel() for p in dit_model.parameters() if p.requires_grad)
+        print(f"Number of parameters (pre-sharded): {model_size}, {model_size / 1e6}M")
+
+        # torch._dynamo.config.cache_size_limit = 8
+        if compile_strat != "eager":
+            if compile_strat == "full": dit_model = torch.compile(dit_model)
+            # Don't bother using dynamic shapes, because we have constant shapes.
+            torch._dynamo.config.dynamic_shapes = False
+            dit_model.apply_compile(True, False)
+
+        if load_checkpoint is not None:
+            load_ckpt(dit_model, Path(load_checkpoint), master_process)
+
+        dit_model = apply_fsdp(dit_model, mesh["dp", "fscp"])
+
 
     if master_process:
         print(f"batch_size: {batch_size}")
@@ -289,7 +362,6 @@ def train_fsdp(
         print(f"lr_scheduler_type: {lr_scheduler_type}")
         print(f"return_index: {return_index}")
         print(f"project_name: {project_name}")
-        print(f"param_count: {param_count / 1e6}M")
 
     if master_process:
         if os.getenv("WANDB_API_KEY") is not None:
@@ -301,7 +373,7 @@ def train_fsdp(
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
                 "num_epochs": num_epochs,
-                "model_parameters": param_count / 1e6,
+                "model_parameters": model_size / 1e6,
                 "model_width": model_width,
                 "model_depth": model_depth,
                 "model_head_dim": model_head_dim,
@@ -311,52 +383,6 @@ def train_fsdp(
 
     # Wrap model in FSDP
     constant_param_name = ["patch_embed", "context_kv", "positional_embedding"]
-
-    # Move model to CUDA device
-
-    load_via_pt = False
-    if load_checkpoint is not None:
-        checkpoint_path = Path(load_checkpoint)
-        load_via_pt = True
-
-        if load_via_pt:
-            if master_process:
-                if not os.path.exists(checkpoint_path / "temp.pt"):
-                    dcp_to_torch_save(checkpoint_path, checkpoint_path / "temp.pt")
-
-            dist.barrier()
-            state_dict = torch.load(checkpoint_path / "temp.pt", map_location="cpu")
-
-            state_dict = {
-                k.replace("module.", "")
-                .replace("_orig_mod.", ""): v.clone()
-                .to(device, dtype=torch.float32)
-                for k, v in state_dict.items()
-            }
-
-            status = dit_model.load_state_dict(state_dict, assign=True, strict=False)
-
-            print(f"Rank {ddp_rank} done loading checkpoint, {status}")
-
-            del state_dict
-            dit_model = dit_model.to(device)
-
-            dist.barrier()
-            print(f"Rank {ddp_rank} done loading checkpoint, {status}")
-
-    # torch._dynamo.config.cache_size_limit = 8
-    if compile_strat != "eager":
-        if compile_strat == "full":
-            dit_model = torch.compile(dit_model)
-        # Don't bother using dynamic shapes, because we have constant shapes.
-        torch._dynamo.config.dynamic_shapes = False
-        dit_model.apply_compile(True, False)
-    dit_model = apply_fsdp(
-        dit_model, param_dtype=torch.bfloat16, reduce_dtype=torch.float32
-    )
-
-    dist.barrier()
-    # state_dict = {}
 
     # Initialize optimizer and scheduler
     if optimizer_type == "mup_adam":
