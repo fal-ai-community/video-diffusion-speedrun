@@ -14,7 +14,7 @@ import torch.distributed.checkpoint as dcp
 import torch.optim as optim
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 # Enable TF32 for faster training
 torch._inductor.config.coordinate_descent_tuning = True
@@ -187,6 +187,9 @@ def forward(
     "--project_name", type=str, default="test_diffusion_test", help="Project name"
 )
 @click.option(
+    "--profile-dir", type=str, default="", help="enable pytorch profiler (will crash), write to directory"
+)
+@click.option(
     "--return_index",
     type=int,
     default=-8,
@@ -215,6 +218,7 @@ def train_fsdp(
     train_bias_and_rms,
     init_std_factor,
     project_name,
+    profile_dir,
     return_index,
     load_checkpoint,
 ):
@@ -418,6 +422,19 @@ def train_fsdp(
     torch.cuda.empty_cache()
     gc.collect()
 
+    if profile_dir:
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        sched = schedule(skip_first=10, wait=5, warmup=1, active=3, repeat=3)
+        handler = lambda p: p.export_chrome_trace(f"{profile_dir}/chrometrace-{global_step}.json")
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        prof_ctx = profile(
+            activities=activities, schedule=sched, on_trace_ready=handler, with_stack=True
+        ) if master_process and profile else nullcontext()
+        prof = prof_ctx.__enter__()
+    else:
+        prof = type('',(),dict(step=lambda:0))
+
+
     for epoch in range(num_epochs):
         if global_step >= max_steps:
             break
@@ -427,44 +444,35 @@ def train_fsdp(
             if global_step >= max_steps:
                 break
 
-            activities = [
-                ProfilerActivity.CPU,
-                ProfilerActivity.CUDA,
-                ProfilerActivity.XPU,
-            ]
+            total_loss, diffusion_loss = forward(
+                dit_model,
+                batch,
+                text_encoder,
+                tokenizer,
+                device,
+                global_step,
+                master_process,
+                generator=None,
+                binnings=(
+                    diffusion_loss_binning,
+                    diffusion_loss_binning_count,
+                ),
+                batch_size=batch_size,
+                return_index=return_index,
+            )
 
-            with (
-                profile(activities=activities) if master_process else nullcontext()
-            ) as prof:
-                total_loss, diffusion_loss = forward(
-                    dit_model,
-                    batch,
-                    text_encoder,
-                    tokenizer,
-                    device,
-                    global_step,
-                    master_process,
-                    generator=None,
-                    binnings=(
-                        diffusion_loss_binning,
-                        diffusion_loss_binning_count,
-                    ),
-                    batch_size=batch_size,
-                    return_index=return_index,
-                )
-
-                # Optimization step
-                backward_start = time.time()
-                with record_function("backward"):
-                    optimizer.zero_grad()
-                    total_loss.backward()
-                    optimizer.step()
-                    lr_scheduler.step()
-                backward_time = time.time() - backward_start
+            # Optimization step
+            backward_start = time.time()
+            with record_function("backward"):
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+            backward_time = time.time() - backward_start
 
             if master_process:
                 logger.info(f"Backward pass took {backward_time*1000:.2f}ms")
-                # prof.export_chrome_trace(f"trace_{global_step}.json")
+                prof.step()
 
             # Logging
             if global_step % 10 == 0:
