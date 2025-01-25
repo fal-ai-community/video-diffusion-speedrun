@@ -48,7 +48,6 @@ from utils import (
     limited_tqdm,
 )
 
-CAPTURE_INPUT = False
 
 
 def create_mesh(fs: int, cp: int) -> tuple[tdm.DeviceMesh, bool]:
@@ -126,7 +125,6 @@ def forward(
     text_encoder,
     tokenizer,
     device,
-    global_step,
     master_process,
     generator=None,
     batch_size=None,
@@ -165,11 +163,6 @@ def forward(
     # time shift
     alpha = 8.0
     t = t * alpha / (1 + (alpha - 1) * t)
-
-    if CAPTURE_INPUT and master_process and global_step == 0:
-        torch.save(vae_latent, f"test_data/vae_latent_{global_step}.pt")
-        torch.save(caption_encoded, f"test_data/caption_encoded_{global_step}.pt")
-        torch.save(t, f"test_data/timesteps_{global_step}.pt")
 
     noise = torch.randn(
         vae_latent.shape, device=device, dtype=torch.bfloat16, generator=generator
@@ -437,17 +430,10 @@ def train_fsdp(
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
-    # Initialize step counter
-    global_step = 0
-
     # Training loop
     dit_model.train()
 
-    diffusion_loss_binning = {k: 0 for k in range(10)}
-    diffusion_loss_binning_count = {k: 0 for k in range(10)}
-
-    time_for_10_steps = time.time()
-
+    # (TODO) do this every k steps like torchtitan
     # clear up memory
     torch.cuda.empty_cache()
     gc.collect()
@@ -455,7 +441,9 @@ def train_fsdp(
     if profile_dir:
         activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
         sched = schedule(skip_first=10, wait=5, warmup=1, active=3, repeat=3)
-        handler = lambda p: p.export_chrome_trace(f"{profile_dir}/chrometrace-{global_step}.json")
+        def handler(p: profile, s=[0]):
+            p.export_chrome_trace(f"{profile_dir}/chrometrace-{s[0]}.json")
+            s[0] += 1
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
         prof_ctx = profile(
             activities=activities, schedule=sched, on_trace_ready=handler, with_stack=True
@@ -466,195 +454,133 @@ def train_fsdp(
 
 
     for epoch in range(num_epochs):
-        if global_step >= max_steps: break
 
-        for batch_idx, batch in enumerate(train_loader):
-            if global_step >= max_steps: break
+    def multiepoch_loop(*, step = 0):
+        for e in range(num_epochs):
+            for i, d in enumerate(train_loader):
+                x, c = d['latent'].cuda(), d['prompt']
+                yield (e,step), (x,c)
+                step += 1
+                if step >= max_steps: return
 
-            total_loss, diffusion_loss = forward(
-                dit_model,
-                batch,
-                text_encoder,
-                tokenizer,
-                device,
-                global_step,
-                master_process,
-                generator=None,
-                binnings=(
-                    diffusion_loss_binning,
-                    diffusion_loss_binning_count,
-                ),
-                batch_size=batch_size,
-                return_index=return_index,
-            )
+    time_for_10_steps = time.time()
+    for (epoch, step), (x, c) in multiepoch_loop():
+        total_loss, diffusion_loss = forward(
+            dit_model,
+            dict(latent=x, prompt=c),
+            text_encoder,
+            tokenizer,
+            device,
+            master_process,
+            generator=None,
+            batch_size=batch_size,
+            return_index=return_index,
+        )
+        # Optimization step
+        backward_start = time.time()
+        with record_function("backward"):
+            total_loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+        backward_time = time.time() - backward_start
 
-            # Optimization step
-            backward_start = time.time()
-            with record_function("backward"):
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-                lr_scheduler.step()
-            backward_time = time.time() - backward_start
+        if master_process:
+            logger.info(f"Backward pass took {backward_time*1000:.2f}ms")
+            prof.step()
+
+        # Logging
+        if step % 10 == 0:
+            step_time = (time.time() - time_for_10_steps) / 10
+            time_for_10_steps = time.time()
+
+            dist.all_reduce(diffusion_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
+            diffusion_loss, total_loss = diffusion_loss.item(), total_loss.item()
 
             if master_process:
-                logger.info(f"Backward pass took {backward_time*1000:.2f}ms")
-                prof.step()
-
-            # Logging
-            if global_step % 10 == 0:
-
-                time_for_10_steps = time.time() - time_for_10_steps
-                time_for_10_steps = time_for_10_steps / 10
-
-                diffusion_loss = avg_scalar_across_ranks(diffusion_loss.item())
-                total_loss = avg_scalar_across_ranks(total_loss.item())
-
-                if master_process:
-                    # Calculate average losses per timestep bin
-                    print(f"Avg fwdbwd steps: {time_for_10_steps*1000:.2f}ms")
-
-                    def get_binned_averages(loss_dict, count_dict):
-                        return {
-                            k: v / max(c, 1)
-                            for k, v, c in zip(
-                                loss_dict.keys(),
-                                loss_dict.values(),
-                                count_dict.values(),
-                            )
-                        }
-
-                    diffusion_binned = get_binned_averages(
-                        diffusion_loss_binning, diffusion_loss_binning_count
-                    )
-
-                    # Log metrics to wandb
-                    wandb.log(
-                        {
-                            "train/diffusion_loss": diffusion_loss,
-                            "train/total_loss": total_loss,
-                            "train/learning_rate": lr_scheduler.get_last_lr()[0],
-                            "train/epoch": epoch,
-                            "train/step": global_step,
-                            "train_binning/diffusion_loss_binning": diffusion_binned,
-                        }
-                    )
-
-                    # Format per-timestep losses for logging
-                    def format_timestep_losses(binned_losses):
-                        return "\n\t".join(
-                            f"{k}: {v:.4f}" for k, v in binned_losses.items()
-                        )
-
-                    diffusion_per_timestep = format_timestep_losses(diffusion_binned)
-
-                    logger.info(
-                        f"Epoch [{epoch}/{num_epochs}] "
-                        f"Step [{global_step}/{max_steps}] "
-                        f"Loss: {total_loss:.4f} "
-                        f"(Diffusion: {diffusion_loss:.4f}) "
-                        f"LR: {lr_scheduler.get_last_lr()[0]:.4f}"
-                        f"\nDiffusion Per-timestep-binned:\n{diffusion_per_timestep}"
-                    )
-
-                    # Reset binning counters
-                    diffusion_loss_binning = {k: 0 for k in range(10)}
-                    diffusion_loss_binning_count = {k: 0 for k in range(10)}
-
-                time_for_10_steps = time.time()
-
-            global_step += 1
-
-            if global_step % evaluate_every == 1:
-
-                generator = torch.Generator(device=device).manual_seed(ddp_rank)
-
-                val_diffusion_loss_binning = {k: 0 for k in range(10)}
-                val_diffusion_loss_binning_count = {k: 0 for k in range(10)}
-
-                dit_model.eval()
-
-                total_losses = []
-                diffusion_losses = []
-                for batch_idx, batch in enumerate(test_loader):
-                    with torch.no_grad():
-                        # torch.compiler.cudagraph_mark_step_begin()
-
-                        total_loss, diffusion_loss = forward(
-                            dit_model,
-                            batch,
-                            text_encoder,
-                            tokenizer,
-                            device,
-                            global_step,
-                            master_process,
-                            generator,
-                            binnings=(
-                                val_diffusion_loss_binning,
-                                val_diffusion_loss_binning_count,
-                            ),
-                            return_index=return_index,
-                        )
-
-                        total_losses.append(total_loss.item())
-                        diffusion_losses.append(diffusion_loss.item())
-
-                        print(
-                            f"Eval, Batch {batch_idx} done, {total_loss.item()}, {diffusion_loss.item()}"
-                        )
-
-                    if batch_idx == 8:
-                        break
-
-                dit_model.train()
-
-                dist.barrier()
-                total_loss = avg_scalar_across_ranks(np.mean(total_losses).item())
-                diffusion_loss = avg_scalar_across_ranks(
-                    np.mean(diffusion_losses).item()
+                print(f"Avg fwdbwd steps: {step_time*1000:.2f}ms")
+                wandb.log({
+                    "train/diffusion_loss": diffusion_loss,
+                    "train/total_loss": total_loss,
+                    "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                    "train/step": step,
+                })
+                logger.info(
+                    f"Epoch [{epoch}/{num_epochs}] "
+                    f"Step [{step}/{max_steps}] "
+                    f"Loss: {total_loss:.4f} "
+                    f"(Diffusion: {diffusion_loss:.4f}) "
+                    f"LR: {lr_scheduler.get_last_lr()[0]:.4f}"
                 )
 
-                state_dict = get_model_state_dict(dit_model)
+        if step % evaluate_every == 0:
+            ## Evaluation ##
+            generator = torch.Generator(device=device).manual_seed(ddp_rank)
+            dit_model.eval()
 
-                if master_process:
-                    os.makedirs("checkpoints", exist_ok=True)
-                    os.makedirs(f"checkpoints/{run_name}", exist_ok=True)
-                    os.makedirs(f"checkpoints/{run_name}/{global_step}", exist_ok=True)
-                    # Save model state dict
+            # (Evaluation loop) #
+            total_losses = []
+            diffusion_losses = []
+            for batch_idx, batch in limited_tqdm(enumerate(test_loader), total=9):
+                with torch.no_grad():
+                    total_loss, diffusion_loss = forward(
+                        dit_model,
+                        batch,
+                        text_encoder,
+                        tokenizer,
+                        device,
+                        master_process,
+                        generator,
+                        return_index=return_index,
+                    )
+
+                    total_losses.append(total_loss.item())
+                    diffusion_losses.append(diffusion_loss.item())
+
                     print(
-                        f"Saving model state dict to checkpoints/{run_name}/{global_step}"
+                        f"Eval, Batch {batch_idx} done, {total_loss.item()}, {diffusion_loss.item()}"
                     )
 
-                    stats = {
-                        k: v / max(c, 1)
-                        for k, v, c in zip(
-                            val_diffusion_loss_binning.keys(),
-                            val_diffusion_loss_binning.values(),
-                            val_diffusion_loss_binning_count.values(),
-                        )
-                    }
-                    wandb.log(
-                        {
-                            "test/total_loss": total_loss,
-                            "test/diffusion_loss": diffusion_loss,
-                            "test_binning/diffusion_loss_binning": stats,
-                        }
-                    )
-                    print(f"Binned Losses: {stats}")
+            dit_model.train()
+            # (End of evaluation loop) #
 
-                dcp.save(
-                    state_dict,
-                    checkpoint_id=Path(f"checkpoints/{run_name}/{global_step}"),
-                )
-                print(f"Epoch {epoch} done")
-                print(f"Global step {global_step}")
+            dist.barrier()
+            total_loss = avg_scalar_across_ranks(np.mean(total_losses).item())
+            diffusion_loss = avg_scalar_across_ranks(
+                np.mean(diffusion_losses).item()
+            )
+            if master_process:
+                wandb.log({
+                    "test/total_loss": total_loss,
+                    "test/diffusion_loss": diffusion_loss,
+                })
 
-        # Cleanup
+            ## Checkpointing ##
+            
+            state_dict = get_model_state_dict(dit_model)
+
+            # TODO: clean up execution environment assumptions
+            if master_process:
+                os.makedirs("checkpoints", exist_ok=True)
+                os.makedirs(f"checkpoints/{run_name}", exist_ok=True)
+                os.makedirs(f"checkpoints/{run_name}/{step}", exist_ok=True)
+                # Save model state dict
+                print(f"Saving model state dict to checkpoints/{run_name}/{step}")
+
+            dcp.save(
+                state_dict,
+                checkpoint_id=Path(f"checkpoints/{run_name}/{step}"),
+            )
+            print(f"Epoch {epoch} done")
+            print(f"Global step {step}")
+
+    # Cleanup
     if master_process:
         wandb.finish()
     cleanup()
 
 
 if __name__ == "__main__":
-
     train_fsdp()
