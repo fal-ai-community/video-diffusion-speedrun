@@ -166,7 +166,17 @@ def forward(
 @click.option(
     "--model_head_dim", type=int, default=128, help="Head dimension of the model"
 )
-@click.option("--compile_models", type=bool, default=False, help="Compile models")
+@click.option(
+    "--compile-strat", type=click.Choice(["eager", "block", "full"]), default="block",
+    help="""torch.compile strategy. Offers the following options:
+    - eager: compile the entire model
+    - block: compile DiT blocks only
+    - full: compile the entire model && T5 enc
+The default option is *block* -- dynamo only needs to trace 1 block once, which
+makes compilation relatively fast (<20s). You should use *full* for full real runs,
+and use *eager* if actively debugging modelling code.
+"""
+)
 @click.option("--optimizer_type", type=str, default="mup_adam", help="Optimizer type")
 @click.option(
     "--lr_scheduler_type",
@@ -242,7 +252,7 @@ def train_fsdp(
 
     # Initialize wandb for the master process
 
-    tokenizer, text_encoder = load_encoders(device=device, compile_models=False)
+    tokenizer, text_encoder = load_encoders(device=device, compile_models=compile_strat == "full")
 
     # with torch.device("meta" if load_checkpoint is not None else device):
     dit_model = DiT(
@@ -334,13 +344,16 @@ def train_fsdp(
             dist.barrier()
             print(f"Rank {ddp_rank} done loading checkpoint, {status}")
 
+    # torch._dynamo.config.cache_size_limit = 8
+    if compile_strat != "eager":
+        if compile_strat == "full":
+            dit_model = torch.compile(dit_model)
+        # Don't bother using dynamic shapes, because we have constant shapes.
+        torch._dynamo.config.dynamic_shapes = False
+        dit_model.apply_compile(True, False)
     dit_model = apply_fsdp(
         dit_model, param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-
-    if compile_models:
-        torch._dynamo.config.cache_size_limit = 8
-        dit_model = torch.compile(dit_model)
 
     dist.barrier()
     # state_dict = {}

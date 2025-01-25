@@ -3,7 +3,7 @@ L=8
 D=4096
 bs=2
 lr=0.0003
-compile=True
+compile=full
 dataset=fake
 
 [ -z "$HF_HUB_TOKEN" ] && echo "warning: HF_HUB_TOKEN is not set"
@@ -33,7 +33,7 @@ $cmd \
     --lr_scheduler_type linear \
     --project_name openvid-diffusion-ci \
     --dataset $dataset \
-    --compile_models $compile
+    --compile-strat $compile
 
 # todo: fix
 # FileNotFoundError: [Errno 2] No such file or directory: './cache/train/continuous/train/index.json' -> './cache/train/index.json'

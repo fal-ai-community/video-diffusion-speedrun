@@ -185,16 +185,16 @@ class ThreeDimRotary(torch.nn.Module):
 
         self.register_buffer("freqs_hwt_cos", freqs_hwt.cos())
         self.register_buffer("freqs_hwt_sin", freqs_hwt.sin())
-        self.rng = random.Random()
+        self.rng = torch.Generator('cuda') # <-- TODO: verify RNG dissimilarity across devices
 
     def forward(self, time_height_width, extend_with_register_tokens=0):
         # TODO: write kernel because in principle these are static shapes
         this_t, this_h, this_w = time_height_width
 
         # randomly, we augment the height and width
-        start_t = self.rng.randint(0, self.t - this_t)
-        start_h = self.rng.randint(0, self.h - this_h)
-        start_w = self.rng.randint(0, self.w - this_w)
+        start_t = torch.randint(0, self.t - this_t + 1, (), generator=self.rng)
+        start_h = torch.randint(0, self.h - this_h + 1, (), generator=self.rng)
+        start_w = torch.randint(0, self.w - this_w + 1, (), generator=self.rng)
 
         cos = self.freqs_hwt_cos[
             start_t : start_t + this_t,
@@ -209,11 +209,11 @@ class ThreeDimRotary(torch.nn.Module):
 
         # append N of zero-attn tokens
         cos = torch.cat([
-            torch.ones(extend_with_register_tokens, cos.shape[-1], device=cos.device),
+            torch.ones(extend_with_register_tokens, cos.shape[-1]),
             cos,
         ])
         sin = torch.cat([
-            torch.ones(extend_with_register_tokens, sin.shape[-1], device=sin.device),
+            torch.ones(extend_with_register_tokens, sin.shape[-1]),
             sin,
         ])
         return cos[None, None], sin[None, None]  # [1, 1, T + N, Attn-dim]
@@ -245,6 +245,8 @@ class DiTStack(nn.ModuleList):
             for _ in range(l)
         ])
         self.seqlen_bounds = dict(min=8192, max=32768) # inclusive
+
+    @torch.compiler.disable(recursive=False)
     def forward(self, x: TT, c: TT, t: TT, rope: tuple[TT,TT]):
         if _D.config.dynamic_shapes:
             # Unfortunately, dynamo doesn't support negative dim indices,
@@ -334,20 +336,22 @@ class DiT(nn.Module):
         for i, block in enumerate(self.blocks):
             if isinstance(block, DiTBlock):
                 self.blocks[i] = torch.compile(block, fullgraph=fullgraph, dynamic=dynamic)
+        self.rope = torch.compile(self.rope, fullgraph=False, dynamic=True)
 
     # segregated method for 2 reasons:
-    # 1. uncompilable
+    # 1. not fullgraphable
     # 2. needed in train loop for CP API
     def get_rope(self, x_shape):
         b, c, t, h, w = x_shape
-        return self.rope(
-            extend_with_register_tokens=16,
-            time_height_width=(
-                t // self.time_patch_size,
-                h // self.patch_size,
-                w // self.patch_size,
-            ),
-        )
+        with torch.device('cuda'):
+            return self.rope(
+                extend_with_register_tokens=16,
+                time_height_width=(
+                    t // self.time_patch_size,
+                    h // self.patch_size,
+                    w // self.patch_size,
+                ),
+            )
 
     def forward(self, x, context, timesteps, rope: tuple[TT,TT]):
         # TODO: document shapes and reduce useless ops here...
@@ -395,6 +399,7 @@ class DiT(nn.Module):
 
         for n, p in self.named_parameters():
             n = n.replace("_fsdp_wrapped_module.", "")
+            n = n.replace("_orig_mod.", "")
             status = self.paramstatus[n]
             if status["requires_grad"]:
                 # Define learning rate for specific types of params
