@@ -305,11 +305,8 @@ class DiT(nn.Module):
             qkv_bias=train_bias_and_rms,
         )
 
-        self.final_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-
-        self.final_norm = nn.RMSNorm(hidden_size, eps=1e-6, elementwise_affine=train_bias_and_rms)
+        self.final_modulation = Modulation(hidden_size, 2)
+        self.final_norm = ModulatedRMSNorm(hidden_size, eps=1e-6, elementwise_affine=train_bias_and_rms)
         self.final_proj = nn.Linear(
             hidden_size, patch_size * patch_size * time_patch_size * self.out_channels
         )
@@ -385,13 +382,11 @@ class DiT(nn.Module):
         x, _ = self.blocks(x, context, t_emb, rope=rope)
 
         x = x[:, 16:, :]
-        final_shift, final_scale = self.final_modulation(t_emb).chunk(2, dim=1)
-        x = self.final_norm(x)
-        x = x * (1 + final_scale[:, None, :]) + final_shift[:, None, :]
-        x = self.final_proj(x)
+        final_shift, final_scale = self.final_modulation(t_emb[:,None])
+        x = self.final_norm(x, final_shift, final_scale)
 
         x = rearrange(
-            x,
+            self.final_proj(x),
             "b (h w t) (p1 p2 p3 c) -> b c (t p3) (h p1) (w p2)",
             t=t // self.time_patch_size,
             h=h // self.patch_size,
