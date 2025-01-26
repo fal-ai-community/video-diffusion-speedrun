@@ -279,7 +279,89 @@ class RegisterTokens(nn.Parameter):
         x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
         x_dt = x_dt.redistribute(placements=[Shard(dim=-2)])
         return x_dt.to_local()
+    @staticmethod
+    def test(ws: int=2):
+        """
+        Numerical test to demonstrate that all *weights* receive the same gradients for a faux simplified model.
 
+        Specifically, we test that when executing:
+            ```
+            F.mse_loss(
+                Linear_aft(
+                    unpack(
+                        registers.mean() * Linear_mid(
+                            pack(Linear_pre(x))
+                        )
+                    )
+                ), y
+            ).backward()
+            ```
+        The gradients for all weights before/within/after packing, using:
+        - randn x,y on 1 GPU
+        - *sharded* x,y across `ws` GPUs
+        are identical.
+
+        *If* this test passes, *then* the correct way to use CP with our DiT is to:
+        - context_parallel shard all inputs *before* forward()
+        - calculate losses with *sharded* outputs -- meaning that reported loss is also *sharded*
+        """
+        from debug import printflock, leave, dist
+        # Initialization
+        mesh = tdm.init_device_mesh("cuda", (ws,), mesh_dim_names=("cp",))
+        torch.cuda.set_device(r := mesh.get_rank())
+
+        # Models / inputs / outputs
+        B, S, D, R = 4, 512, 1024, 16
+        with torch.device('cuda'), torch.random.fork_rng(['cuda']):
+            torch.manual_seed(0)
+            pre = nn.Linear(D,D,bias=False)
+            mid = nn.Linear(D,D,bias=False)
+            self = RegisterTokens(torch.randn(1, R, D))
+            aft = nn.Linear(D,D,bias=False)
+            x = torch.randn(B, S, D, requires_grad=True)
+            x_dist = torch.empty(B, S//ws, D, requires_grad=True)
+            with torch.no_grad(): x_dist.copy_(x.chunk(ws,dim=-2)[r])
+            y_dist = (y := torch.randn_like(x)).chunk(ws, dim=-2)[r]
+
+        # Rank 0 test: x --Linear--> x --packing--> x_r0_packed --Linear*p.mean()--> x_r0_packed --unpack--> x_r0_unpack --Linear--> x_r0_unpack
+        x = pre(x)
+        x_r0_packed = torch.cat([self.repeat(B,1,1), x], dim=-2)
+        x_r0_packed = mid(x_r0_packed) * self.mean()
+        x_r0_unpack = x_r0_packed[:,R:]
+        x_r0_unpack = aft(x_r0_unpack)
+        F.mse_loss(x_r0_unpack, y).backward()
+
+        # Clear/save grads
+        pre_r0_grad = pre.weight.grad.clone(); pre.weight.grad = None
+        reg_r0_grad = self.grad.clone(); self.grad = None
+        lin_r0_grad = mid.weight.grad.clone(); mid.weight.grad = None
+        aft_r0_grad = aft.weight.grad.clone(); aft.weight.grad = None
+
+        # CP test: x --Linear--> x --packing--> x_r0_packed --Linear*p.mean()--> x_r0_packed --unpack--> x_r0_unpack --Linear--> x_r0_unpack
+        x_dist = pre(x_dist)
+        x_dist_packed = RegisterTokens.pack(self, x_dist, mesh)
+        x_dist_packed = mid(x_dist_packed) * self.mean()
+        x_dist_unpack = RegisterTokens.unpack(self, x_dist_packed, mesh)
+        x_dist_unpack = aft(x_dist_unpack)
+        F.mse_loss(x_dist_unpack, y_dist).backward()
+
+        # Clear/save/reduce (as ddp would) grads
+        pre_dist_grad = pre.weight.grad.clone(); pre.weight.grad = None
+        reg_dist_grad = self.grad.clone(); self.grad = None
+        lin_dist_grad = mid.weight.grad.clone(); mid.weight.grad = None
+        aft_dist_grad = aft.weight.grad.clone(); aft.weight.grad = None
+        dist.all_reduce(reg_dist_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+        dist.all_reduce(lin_dist_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+        dist.all_reduce(pre_dist_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+        dist.all_reduce(aft_dist_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+
+        assert torch.allclose(x_r0_unpack.chunk(ws, dim=-2)[r], x_dist_unpack)
+        assert torch.allclose(pre_r0_grad, pre_dist_grad)
+        assert torch.allclose(reg_r0_grad, reg_dist_grad)
+        assert torch.allclose(lin_r0_grad, lin_dist_grad)
+        assert torch.allclose(aft_r0_grad, aft_dist_grad)
+
+        leave()
 
 class DiTStack(nn.ModuleList):
     # wrapper module containing DiT blocks. useful for input conversion to/from DTensor.
@@ -589,5 +671,8 @@ def bench(comp: bool, dshapes: bool):
             for p in m.parameters(): p.grad = None
 
 if __name__ == "__main__":
-    with torch.device('cuda'), torch.autocast('cuda', torch.bfloat16):
-        bench(True, True)
+    if (ws := int(__import__("os").environ.get("WORLD_SIZE", 1))) > 1:
+        RegisterTokens.test(ws)
+    else:
+        with torch.device('cuda'), torch.autocast('cuda', torch.bfloat16):
+            bench(True, True)
