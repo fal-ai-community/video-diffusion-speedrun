@@ -259,10 +259,10 @@ class RegisterTokens(nn.Parameter):
             return torch.cat([registers, x], dim=-2)
 
         # EXTREMELY LAZY SOLUTION: allgather full seq, then redistribute (slice in fwd, allgather in bwd)
-        if x.requires_grad: # I don't understand why this is mathematically required.
-            x.register_hook(lambda x: x / cp)
         x_gather = funcol.all_gather_tensor_autograd(x, -2, mesh_cp.get_group())
         x_gather = torch.cat([registers, x_gather], dim=-2)
+        if x_gather.requires_grad: # I don't understand why this is mathematically required.
+            x_gather.register_hook(lambda x: x / cp)
         x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
         x_dt = x_dt.redistribute(placements=[Shard(dim=-2)])
         return x_dt.to_local()
@@ -279,6 +279,70 @@ class RegisterTokens(nn.Parameter):
         x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
         x_dt = x_dt.redistribute(placements=[Shard(dim=-2)])
         return x_dt.to_local()
+    @staticmethod
+    def test2(ws: int):
+        from debug import printflock, leave, dist, NoZeroInit
+        from lovely_tensors import set_config
+        set_config(precision=4, sci_mode=True, color=True)
+        # Initialization
+        mesh_cp = tdm.init_device_mesh("cuda", (ws,), mesh_dim_names=("cp",))
+        torch.cuda.set_device(r := mesh_cp.get_rank())
+
+        # Models / inputs / outputs
+        B, C, S, D, R = 4, 16, 512, 1024, 16
+        with torch.device('cuda'), torch.random.fork_rng(['cuda']), NoZeroInit():
+            torch.set_default_dtype(torch.bfloat16)
+            torch.manual_seed(0)
+            m = DiT(
+                in_channels=16,
+                patch_size=2,
+                depth=2,
+                num_heads=D // 128,
+                mlp_ratio=4.0,
+                cross_attn_input_size=4096,
+                hidden_size=D,
+                residual_v=True,
+                train_bias_and_rms=True,
+                use_rope=True,
+            )
+            t = torch.rand(B)
+            z_t = torch.randn(B, C, 16, 64, 64)
+            v_objective = torch.randn_like(z_t)
+            caption_encoded = torch.randn(B, S, 4096)
+            rope = m.get_rope(z_t.shape)
+            torch.set_default_dtype(torch.float32)
+        for n, p in m.named_parameters():
+            assert p.nonzero().numel() > 0, f"Parameter {n} ({p}) contains all zeros"
+
+        if dist.get_rank() == 0:
+            printflock(t)
+            printflock(z_t)
+            printflock(v_objective)
+            printflock(caption_encoded)
+            printflock(rope)
+        dist.barrier()
+
+        DiT.mesh_cp = mesh_cp # <-- for register tokens
+        from torch.distributed.tensor.experimental import context_parallel, _attention, implicit_replication
+        from contextlib import nullcontext
+        _attention._cp_options.enable_load_balance = False
+        with context_parallel(
+            mesh_cp,
+            buffers=[z_t, v_objective, caption_encoded, rope[0], rope[1]],
+            buffer_seq_dims=[-3, -3, -2, -2, -2],
+            no_restore_buffers={z_t, v_objective, caption_encoded, rope[0], rope[1]},
+        ) if mesh_cp.size(0) > 1 else nullcontext():
+            output = m(z_t, caption_encoded, t, rope=rope)
+            diffusion_loss = (v_objective.float() - output.float()).pow(2).mean()
+            diffusion_loss.backward()
+        for n,p in m.named_parameters():
+            if p.grad is None:
+                print(f"WARNING: {n} has no grad") if dist.get_rank() == 0 else None
+                continue
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=mesh_cp.get_group())
+            if dist.get_rank() == 0:
+                print(p.grad)
+
     @staticmethod
     def test(ws: int=2):
         """
@@ -672,7 +736,9 @@ def bench(comp: bool, dshapes: bool):
 
 if __name__ == "__main__":
     if (ws := int(__import__("os").environ.get("WORLD_SIZE", 1))) > 1:
-        RegisterTokens.test(ws)
+        RegisterTokens.test2(ws)
+        # RegisterTokens.test(ws)
     else:
-        with torch.device('cuda'), torch.autocast('cuda', torch.bfloat16):
-            bench(True, True)
+        RegisterTokens.test2(ws)
+        # with torch.device('cuda'), torch.autocast('cuda', torch.bfloat16):
+        #     bench(True, True)
