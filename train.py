@@ -182,6 +182,7 @@ def forward_plusmaybe_backward(
 
     We don't restore any buffers because they aren't needed, generally.
     '''
+    DiT.mesh_cp = mesh_cp # <-- for register tokens
     with context_parallel(
         mesh_cp,
         buffers=[z_t, v_objective, caption_encoded, rope[0], rope[1]],
@@ -468,7 +469,7 @@ def train_fsdp(
                 # TODO: have a replication PG in LavenderStreamingDataset.
                 if mesh['data_gather'].size(0) != 1:
                     gather_pg = mesh['data_gather'].get_group()
-                    x = async_allgather_stack(x, gather_pg).flatten(end_dim=1)
+                    x = async_allgather_stack(x, gather_pg)()
                     prompts = [None] * gather_pg.size()
                     dist.all_gather_object(prompts, c, group=gather_pg)
                     c = [p for ls in prompts for p in ls]

@@ -6,8 +6,10 @@ from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+import torch.distributed._functional_collectives as funcol
+from einops import rearrange, pack
 from torch import nn, Tensor as TT
+from torch.distributed.tensor import DTensor, Replicate, Shard, device_mesh as tdm
 import torch._dynamo as _D
 
 
@@ -222,6 +224,55 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).to(dtype=orig_dtype)
 
+'''
+TODO: it is extremely dumb to do all the work of copying over the large tensor to move some small register buffer.
+Ideally, the conv3d would be "register-aware" and allocate some padding space in the output tensor. but can we do that?
+'''
+
+class RegisterTokens(nn.Parameter):
+    # Sequence-parallelizable register tokens
+    @staticmethod
+    def calc(self, mesh_cp: tdm.DeviceMesh) -> tuple[int, int, int]:
+        cp,rank = mesh_cp.size(0), mesh_cp.get_rank()
+        regs = self.size(-2)
+        extra, remainder = divmod(regs, cp)
+        assert remainder == 0, "register token count must be divisible by cp"
+        return cp, rank, extra
+    # # the entire sequence is "pushed forward" by `regs`, so each rank needs `regs/cp` more space.
+    # final_local_slen = x.size(-2) + extra
+    # out = torch.empty(x.size(0), final_local_slen, *x.shape[2:], device=x.device, dtype=x.dtype)
+    # i_start = regs - extra * rank
+    # j_stop = final_local_slen - regs + extra * (rank+1)
+    # out[:, i_start:] = x[:, :j_stop]
+    # if rank == 0:
+    #     out[:, :regs] = self.register_tokens
+    # send_len = 
+    @staticmethod
+    def pack(self, x: TT, mesh_cp: tdm.DeviceMesh) -> TT:
+        # Starting assumption: x was context_parallel split'd and conv'd
+        cp,rank,extra = RegisterTokens.calc(self, mesh_cp)
+        registers = self.repeat(x.size(0), 1, 1)
+        if cp == 1: return torch.cat([registers, x], dim=-2)
+
+        # EXTREMELY LAZY SOLUTION: allgather full seq, then redistribute (slice in fwd, allgather in bwd)
+        x_gather = funcol.all_gather_tensor_autograd(x, -2, mesh_cp.get_group())
+        x_gather = torch.cat([registers, x_gather], dim=-2)
+        x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
+        x_dt = x_dt.redistribute(placements=[Shard(dim=-2)])
+        return x_dt.to_local()
+    @staticmethod
+    def unpack(self, x: TT, mesh_cp: tdm.DeviceMesh) -> TT:
+        cp,rank,extra = RegisterTokens.calc(self, mesh_cp)
+        if cp == 1: return x[:, self.size(-2):]
+
+        # EXTREMELY LAZY SOLUTION: allgather full seq, then redistribute (slice in fwd, allgather in bwd)
+        x_gather = funcol.all_gather_tensor_autograd(x, -2, mesh_cp.get_group())
+        x_gather = x_gather[:, self.size(-2):]
+        x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
+        x_dt = x_dt.redistribute(placements=[Shard(dim=-2)])
+        return x_dt.to_local()
+
+
 class DiTStack(nn.ModuleList):
     # wrapper module containing DiT blocks. useful for input conversion to/from DTensor.
     def __init__(self, d: int, l: int, *, n_heads: int, r_mlp: float, xattn_dim: int, residual_v: bool, qkv_bias: bool):
@@ -288,7 +339,7 @@ class DiT(nn.Module):
             hidden_size // (2 * num_heads), h=128, w=128, t=128
         )
 
-        self.register_tokens = nn.Parameter(torch.randn(1, 16, hidden_size))
+        self.register_tokens = RegisterTokens(torch.randn(1, 16, hidden_size))
 
         self.time_embed = nn.Sequential(
             nn.Linear(hidden_size, 4 * hidden_size),
@@ -371,9 +422,8 @@ class DiT(nn.Module):
         # TODO: document shapes and reduce useless ops here...
         b, c, t, h, w = x.shape
         x = self.patch_embed(x)  # b, T, d
-
-        x = torch.cat([self.register_tokens.repeat(b, 1, 1), x], 1)  # b, T + N, d
-
+        x = RegisterTokens.pack(self.register_tokens, x, DiT.mesh_cp)
+        # TODO: cache timestep freqs
         t_emb = timestep_embedding(timesteps, self.hidden_size).to(
             x.device, dtype=x.dtype
         )
@@ -381,7 +431,7 @@ class DiT(nn.Module):
 
         x, _ = self.blocks(x, context, t_emb, rope=rope)
 
-        x = x[:, 16:, :]
+        x = RegisterTokens.unpack(self.register_tokens, x, DiT.mesh_cp)
         final_shift, final_scale = self.final_modulation(t_emb[:,None])
         x = self.final_norm(x, final_shift, final_scale)
 
