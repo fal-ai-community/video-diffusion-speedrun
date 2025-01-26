@@ -479,6 +479,18 @@ def train_fsdp(
                 step += 1
                 if step >= max_steps: return
 
+    # For training purposes: all processes with *different* batches must have *different* random seeding,
+    data_seed = mesh['data_unique'].get_rank()
+    torch.manual_seed(data_seed)
+    np.random.seed(data_seed)
+    # and all processes that have the same microbatch **must** have the same seed.
+
+    # This is also a warning to implementers: be CERTAIN you aren't rank-conditionally
+    # executing any global random methods in your model's forward pass. Some easy ways to fuck this up:
+    # * executing any random methods at all, in rank0/master_process-only code.
+    # * using double-random conditions [e.g. if random() > 0.5: x = random(...)]
+    # You can also protect yourself against this kind of trouble with `torch.random.fork_rng(...)`.
+
     time_for_10_steps = time.time()
     for (epoch, step), (x, c) in multiepoch_loop():
         e = prompt2context(text_encoder, tokenizer, c, device, return_index=-1)
@@ -515,27 +527,27 @@ def train_fsdp(
                 )
 
         if step % evaluate_every == 0:
-            ## Evaluation ##
+            ### Evaluation ###
             dit_model.eval()
 
-            # (Evaluation loop) #
+            ## (Evaluation loop) ##
             total_losses = []
             diffusion_losses = []
             with torch.random.fork_rng(['cuda']), torch.no_grad():
                 torch.manual_seed(ddp_rank)
                 for batch_idx, batch in limited_tqdm(enumerate(test_loader), total=9):
                     e = prompt2context(text_encoder, tokenizer, batch["prompt"], device, return_index=-1)
-                    total_loss, diffusion_loss = forward_plusmaybe_backward(mesh['cp'], dit_model, batch["latent"], e, timeit_r0, backward=False)
+                    total_loss, diffusion_loss = forward_plusmaybe_backward(
+                        mesh['cp'], dit_model, batch["latent"], e, timeit_r0, backward=False
+                    )
                     total_losses.append(total_loss.item())
                     diffusion_losses.append(diffusion_loss.item())
-
-                    print(
-                        f"Eval, Batch {batch_idx} done, {total_loss.item()}, {diffusion_loss.item()}"
-                    )
+                    print(f"Eval, Batch {batch_idx} done, {total_losses[-1]}, {diffusion_losses[-1]}")
 
             dit_model.train()
-            # (End of evaluation loop) #
+            ## (End of evaluation loop) ##
 
+            ## log evals
             dist.barrier()
             total_loss = avg_scalar_across_ranks(np.mean(total_losses).item())
             diffusion_loss = avg_scalar_across_ranks(
@@ -548,7 +560,6 @@ def train_fsdp(
                 })
 
             ## Checkpointing ##
-            
             state_dict = get_model_state_dict(dit_model)
 
             # TODO: clean up execution environment assumptions
