@@ -232,12 +232,14 @@ Ideally, the conv3d would be "register-aware" and allocate some padding space in
 class RegisterTokens(nn.Parameter):
     # Sequence-parallelizable register tokens
     @staticmethod
-    def calc(self, mesh_cp: tdm.DeviceMesh) -> tuple[int, int, int]:
+    def calc(self, mesh_cp: tdm.DeviceMesh) -> int:
         cp,rank = mesh_cp.size(0), mesh_cp.get_rank()
         regs = self.size(-2)
         extra, remainder = divmod(regs, cp)
         assert remainder == 0, "register token count must be divisible by cp"
-        return cp, rank, extra
+        return cp
+
+    ### TODO: more efficient approach:
     # # the entire sequence is "pushed forward" by `regs`, so each rank needs `regs/cp` more space.
     # final_local_slen = x.size(-2) + extra
     # out = torch.empty(x.size(0), final_local_slen, *x.shape[2:], device=x.device, dtype=x.dtype)
@@ -247,25 +249,31 @@ class RegisterTokens(nn.Parameter):
     # if rank == 0:
     #     out[:, :regs] = self.register_tokens
     # send_len = 
+    ### end TODO
+
     @staticmethod
-    def pack(self, x: TT, mesh_cp: tdm.DeviceMesh) -> TT:
+    def pack(self, x: TT, mesh_cp: tdm.DeviceMesh | None) -> TT:
         # Starting assumption: x was context_parallel split'd and conv'd
-        cp,rank,extra = RegisterTokens.calc(self, mesh_cp)
         registers = self.repeat(x.size(0), 1, 1)
-        if cp == 1: return torch.cat([registers, x], dim=-2)
+        if mesh_cp is None or (cp := RegisterTokens.calc(self, mesh_cp)) == 1:
+            return torch.cat([registers, x], dim=-2)
 
         # EXTREMELY LAZY SOLUTION: allgather full seq, then redistribute (slice in fwd, allgather in bwd)
+        if x.requires_grad: # I don't understand why this is mathematically required.
+            x.register_hook(lambda x: x / cp)
         x_gather = funcol.all_gather_tensor_autograd(x, -2, mesh_cp.get_group())
         x_gather = torch.cat([registers, x_gather], dim=-2)
         x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
         x_dt = x_dt.redistribute(placements=[Shard(dim=-2)])
         return x_dt.to_local()
     @staticmethod
-    def unpack(self, x: TT, mesh_cp: tdm.DeviceMesh) -> TT:
-        cp,rank,extra = RegisterTokens.calc(self, mesh_cp)
-        if cp == 1: return x[:, self.size(-2):]
+    def unpack(self, x: TT, mesh_cp: tdm.DeviceMesh | None) -> TT:
+        if mesh_cp is None or (cp := RegisterTokens.calc(self, mesh_cp)) == 1:
+            return x[:, self.size(-2):]
 
         # EXTREMELY LAZY SOLUTION: allgather full seq, then redistribute (slice in fwd, allgather in bwd)
+        if x.requires_grad: # I don't understand why this is mathematically required.
+            x.register_hook(lambda x: x / cp)
         x_gather = funcol.all_gather_tensor_autograd(x, -2, mesh_cp.get_group())
         x_gather = x_gather[:, self.size(-2):]
         x_dt = DTensor.from_local(x_gather, mesh_cp, placements=[Replicate()])
@@ -306,6 +314,7 @@ class DiTStack(nn.ModuleList):
         return x, v_0
 
 class DiT(nn.Module):
+    mesh_cp = None
     def __init__(
         self,
         in_channels=4,
