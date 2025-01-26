@@ -12,6 +12,8 @@ bs=2
 lr=0.001
 compile=block
 dataset=real
+cp="${1:-1}"
+fs="${2:-1}"
 
 [ -z "$HF_HUB_TOKEN" ] && echo "warning: HF_HUB_TOKEN is not set"
 [ -z "$HF_HOME" ] && echo "warning: HF_HOME is not set"
@@ -25,7 +27,7 @@ fi
 export OMP_NUM_THREADS=32
 
 if [ -z "$SLURM_JOB_ID" ]
-then cmd='torchrun --nproc_per_node=2 train.py'
+then cmd='torchrun --standalone --nproc_per_node=4 train.py'
 else cmd='./slurm.sh'
 fi
 
@@ -43,7 +45,6 @@ $cmd \
     --lr_scheduler_type linear \
     --project_name openvid-diffusion-dbg \
     --dataset $dataset \
-    --compile-strat $compile 
-    --fs 4 \
-    --cp 2 \
+    --compile-strat $compile \
+    --cp $cp --fs $fs
     # --profile-dir ./profile-train \

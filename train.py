@@ -201,8 +201,8 @@ def forward_plusmaybe_backward(
 
 
 @click.command()
-@click.option("--fs", type=int, default=1, help="fsdp2 (z2) shard factor")
-@click.option("--cp", type=int, default=1, help="context parallel shard factor")
+@click.option("--fs", type=int, default=1, help="**extra** fsdp2 (z2) shard factor, on top of what CP already uses.")
+@click.option("--cp", type=int, default=1, help="context parallel shard factor, which will be applied together with fsdp2 on the same axis.")
 @click.option("--dataset", type=click.Choice(["real", "fake"]), default="real", help="Dataset to use")
 @click.option("--num_epochs", type=int, default=2, help="Number of training epochs")
 @click.option("--batch_size", type=int, default=64, help="Batch size for training")

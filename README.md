@@ -54,3 +54,28 @@ with torch.device('cuda'):
 ```
 
 `py a.py 1` will error on 2.5.1
+
+
+##### note on parallelism
+this trainer supports simple ddp + fsdp2 (zero2) + cp training.
+
+when CP is enabled, it is always used in conjunction with fsdp2. examples:
+
+###### `--fs 1 --cp 1`
+this is the default, and implies all GPUs participate in simple DDP.
+
+###### `--fs 2`
+this enables fsdp2 with `reshard_after_forward=False` on pairs of GPUs, and otherwise uses DDP across.
+
+###### `--cp 2`
+this enables CP *and* fsdp2 across pairs of GPUs.
+
+between a GPU pair,
+* each input sequence will be split in half by `context_parallel`
+* each parameter will be sharded by half and regathered every step
+
+###### `--fs 2 --cp 4`
+The total fsdp2 factor is `fs * cp = 8`, so the effective FSDP world size will be **8**.
+
+within those 8 GPUs, each sequence will be split into quarter chunks.
+
