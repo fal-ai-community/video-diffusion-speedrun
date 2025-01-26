@@ -233,7 +233,7 @@ class RegisterTokens(nn.Parameter):
     # Sequence-parallelizable register tokens
     @staticmethod
     def calc(self, mesh_cp: tdm.DeviceMesh) -> int:
-        cp,rank = mesh_cp.size(0), mesh_cp.get_rank()
+        cp,rank = mesh_cp.size(0), mesh_cp.get_local_rank()
         regs = self.size(-2)
         extra, remainder = divmod(regs, cp)
         assert remainder == 0, "register token count must be divisible by cp"
@@ -286,7 +286,7 @@ class RegisterTokens(nn.Parameter):
         set_config(precision=4, sci_mode=True, color=True)
         # Initialization
         mesh_cp = tdm.init_device_mesh("cuda", (ws,), mesh_dim_names=("cp",))
-        torch.cuda.set_device(r := mesh_cp.get_rank())
+        torch.cuda.set_device(r := mesh_cp.get_local_rank())
 
         # Models / inputs / outputs
         B, C, S, D, R = 4, 16, 512, 1024, 16
@@ -372,7 +372,7 @@ class RegisterTokens(nn.Parameter):
         from debug import printflock, leave, dist
         # Initialization
         mesh = tdm.init_device_mesh("cuda", (ws,), mesh_dim_names=("cp",))
-        torch.cuda.set_device(r := mesh.get_rank())
+        torch.cuda.set_device(r := mesh.get_local_rank())
 
         # Models / inputs / outputs
         B, S, D, R = 4, 512, 1024, 16

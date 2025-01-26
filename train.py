@@ -480,7 +480,7 @@ def train_fsdp(
                 if step >= max_steps: return
 
     # For training purposes: all processes with *different* batches must have *different* random seeding,
-    data_seed = mesh['data_unique'].get_rank()
+    data_seed = mesh['data_unique'].get_local_rank()
     torch.manual_seed(data_seed)
     np.random.seed(data_seed)
     # and all processes that have the same microbatch **must** have the same seed.
@@ -534,11 +534,17 @@ def train_fsdp(
             total_losses = []
             diffusion_losses = []
             with torch.random.fork_rng(['cuda']), torch.no_grad():
-                torch.manual_seed(ddp_rank)
+                # TODO: we don't account for CP here. Instead we:
+                # 1. assume the test loader yields unique data per rank,
+                # 2. assume mesh['pp'] will be of size 1 and so CP won't trigger,
+                # 3. assume we have enough vram to do inference without CP.
+                # this makes the loss computation equivalent to the non-CP case, which is conveinent
+                # because our train loss actually represents a different distribution per-CP-rank
+                torch.manual_seed(dist.get_rank())
                 for batch_idx, batch in limited_tqdm(enumerate(test_loader), total=9):
                     e = prompt2context(text_encoder, tokenizer, batch["prompt"], device, return_index=-1)
                     total_loss, diffusion_loss = forward_plusmaybe_backward(
-                        mesh['cp'], dit_model, batch["latent"], e, timeit_r0, backward=False
+                        mesh['pp'], dit_model, batch["latent"], e, timeit_r0, backward=False
                     )
                     total_losses.append(total_loss.item())
                     diffusion_losses.append(diffusion_loss.item())
